@@ -3,3 +3,4 @@ trade_log.csv
 venv/
 __pycache__/
 *.pyc
+logs/
