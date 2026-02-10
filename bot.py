@@ -9,32 +9,34 @@ from typing import Optional, Dict, Any, List
 import requests
 from dotenv import load_dotenv
 
-from paper_portfolio import PaperPortfolio
-
 
 # -----------------------------
-# Constants (safe defaults)
+# Constants
 # -----------------------------
 AUTH_URL = "https://api.public.com/userapiauthservice/personal/access-tokens"
 ACCOUNT_URL = "https://api.public.com/userapigateway/trading/account"
 QUOTES_URL_TMPL = "https://api.public.com/userapigateway/marketdata/{accountId}/quotes"
 ORDER_URL_TMPL = "https://api.public.com/userapigateway/trading/{accountId}/order"
-ORDER_STATUS_URL_TMPL = "https://api.public.com/userapigateway/trading/{accountId}/order/{orderId}"
+PORTFOLIO_V2_URL_TMPL = "https://api.public.com/userapigateway/trading/{accountId}/portfolio/v2"
 
-ALLOWED_SYMBOLS = {"SPY"}  # start with one symbol only
+ALLOWED_SYMBOLS = {"SPY"}
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# -----------------------------
-# Logging (CSV) with Windows-safe retry
-# -----------------------------
+def today_key_utc() -> str:
+    return utcnow().strftime("%Y-%m-%d")
+
+
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+# -----------------------------
+# Logging (CSV) with Windows-safe retry
+# -----------------------------
 def ensure_log_header(path: str) -> None:
     if os.path.exists(path):
         return
@@ -46,7 +48,6 @@ def ensure_log_header(path: str) -> None:
 def append_log(log_file: str, event: str, symbol: str = "", side: str = "", amount_usd: str = "",
                order_id: str = "", status: str = "", details: str = "") -> None:
     ensure_log_header(log_file)
-    # retry for Windows file lock
     for _ in range(3):
         try:
             with open(log_file, "a", newline="", encoding="utf-8") as f:
@@ -55,35 +56,10 @@ def append_log(log_file: str, event: str, symbol: str = "", side: str = "", amou
             return
         except PermissionError:
             time.sleep(0.2)
-    # if it still fails, raise
+    # last attempt
     with open(log_file, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([utcnow().isoformat(), event, symbol, side, amount_usd, order_id, status, details])
-
-
-def log_paper_equity(equity_file: str, total_value: float, cash: float, positions: dict) -> None:
-    file_exists = os.path.exists(equity_file)
-    # retry for Windows file lock
-    for _ in range(3):
-        try:
-            with open(equity_file, "a", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                if not file_exists:
-                    w.writerow(["timestamp_utc", "total_value", "cash", "positions_json"])
-                w.writerow([utcnow().isoformat(), f"{total_value:.4f}", f"{cash:.4f}", str(positions)])
-            return
-        except PermissionError:
-            time.sleep(0.2)
-    # last attempt
-    with open(equity_file, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if not file_exists:
-            w.writerow(["timestamp_utc", "total_value", "cash", "positions_json"])
-        w.writerow([utcnow().isoformat(), f"{total_value:.4f}", f"{cash:.4f}", str(positions)])
-
-
-def today_key_utc() -> str:
-    return utcnow().strftime("%Y-%m-%d")
 
 
 def count_trades_today(log_file: str) -> int:
@@ -96,7 +72,7 @@ def count_trades_today(log_file: str) -> int:
         for row in r:
             ts = row.get("timestamp_utc", "")
             ev = row.get("event", "")
-            if ts.startswith(tkey) and ev in ("ORDER_SUBMITTED", "PAPER_TRADE", "LIVE_ORDER"):
+            if ts.startswith(tkey) and ev in ("LIVE_BUY_SUBMITTED", "LIVE_SELL_SUBMITTED"):
                 n += 1
     return n
 
@@ -126,7 +102,6 @@ class PublicAuth:
         )
         resp.raise_for_status()
         token = resp.json()["accessToken"]
-        # refresh a bit early (2 min buffer)
         expires_at = utcnow() + timedelta(minutes=max(1, self.validity_minutes - 2))
         return AccessToken(token=token, expires_at_utc=expires_at)
 
@@ -174,6 +149,18 @@ class PublicClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_portfolio_v2(self) -> Dict[str, Any]:
+        account_id = self.get_account_id()
+        url = PORTFOLIO_V2_URL_TMPL.format(accountId=account_id)
+        resp = requests.get(url, headers=self.auth.auth_headers(), timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
+    @staticmethod
+    def deterministic_order_id(account_id: str, side: str, symbol: str) -> str:
+        seed = f"{account_id}:{today_key_utc()}:{side}:{symbol}"
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
+
     def place_market_buy_amount(self, symbol: str, amount_usd: float) -> Dict[str, Any]:
         if symbol not in ALLOWED_SYMBOLS:
             raise ValueError(f"Symbol {symbol} not in ALLOWED_SYMBOLS.")
@@ -182,7 +169,7 @@ class PublicClient:
 
         account_id = self.get_account_id()
         url = ORDER_URL_TMPL.format(accountId=account_id)
-        order_id = str(uuid.uuid4())
+        order_id = self.deterministic_order_id(account_id, "BUY", symbol)
 
         payload = {
             "orderId": order_id,
@@ -200,177 +187,266 @@ class PublicClient:
             timeout=30,
         )
         resp.raise_for_status()
-        data = resp.json()
+        return {"orderId": order_id, "response": resp.json()}
 
-        append_log(
-            self.log_file,
-            "ORDER_SUBMITTED",
-            symbol=symbol,
-            side="BUY",
-            amount_usd=f"{amount_usd:.2f}",
-            order_id=order_id,
-            status="SUBMITTED",
-            details="Market buy by notional amount",
-        )
-        return {"orderId": order_id, "response": data}
+    def place_market_sell_quantity(self, symbol: str, quantity: float) -> Dict[str, Any]:
+        if symbol not in ALLOWED_SYMBOLS:
+            raise ValueError(f"Symbol {symbol} not in ALLOWED_SYMBOLS.")
+        if quantity <= 0:
+            raise ValueError("quantity must be > 0")
 
-    def get_order_status(self, order_id: str) -> Dict[str, Any]:
         account_id = self.get_account_id()
-        url = ORDER_STATUS_URL_TMPL.format(accountId=account_id, orderId=order_id)
-        resp = requests.get(url, headers=self.auth.auth_headers(), timeout=30)
-        if resp.status_code == 404:
-            return {"status": "NOT_READY"}
+        url = ORDER_URL_TMPL.format(accountId=account_id)
+        order_id = self.deterministic_order_id(account_id, "SELL", symbol)
+
+        payload = {
+            "orderId": order_id,
+            "instrument": {"symbol": symbol, "type": "EQUITY"},
+            "orderSide": "SELL",
+            "orderType": "MARKET",
+            "expiration": {"timeInForce": "DAY"},
+            "quantity": f"{quantity:.8f}",
+        }
+
+        resp = requests.post(
+            url,
+            headers={**self.auth.auth_headers(), "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
         resp.raise_for_status()
-        return resp.json()
+        return {"orderId": order_id, "response": resp.json()}
 
 
 # -----------------------------
-# Trading Logic (simple)
+# Helpers to read portfolio
 # -----------------------------
-def run_trading_logic(
+def find_equity_position(portfolio: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
+    positions = portfolio.get("positions") or []
+    for p in positions:
+        inst = (p.get("instrument") or {})
+        if inst.get("symbol") == symbol and inst.get("type") == "EQUITY":
+            return p
+    return None
+
+
+def get_buying_power_usd(portfolio: Dict[str, Any]) -> float:
+    bp = portfolio.get("buyingPower") or {}
+    for key in ("cashOnlyBuyingPower", "buyingPower", "availableBuyingPower"):
+        val = bp.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except Exception:
+                pass
+    return 0.0
+
+
+def get_unit_cost(pos: Dict[str, Any]) -> float:
+    cb = pos.get("costBasis") or {}
+    for key in ("unitCost", "averageCost", "avgCost", "averagePrice"):
+        val = cb.get(key)
+        if val is not None:
+            try:
+                f = float(val)
+                if f > 0:
+                    return f
+            except Exception:
+                pass
+    return 0.0
+
+
+def get_position_qty(pos: Dict[str, Any]) -> float:
+    for key in ("quantity", "qty", "shares"):
+        val = pos.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except Exception:
+                pass
+    return 0.0
+
+
+def get_unrealized_pnl_pct(pos: Dict[str, Any]) -> Optional[float]:
+    """
+    Prefer Portfolio V2's instrumentGain.gainPercentage (e.g. "-0.12" means -0.12%),
+    convert it to decimal (-0.0012). Fallback to cost basis math if needed.
+    """
+    ig = pos.get("instrumentGain") or {}
+    gp = ig.get("gainPercentage")
+    if gp is not None:
+        try:
+            return float(gp) / 100.0
+        except Exception:
+            pass
+
+    unit_cost = get_unit_cost(pos)
+    lp = (pos.get("lastPrice") or {}).get("lastPrice")
+    try:
+        last = float(lp) if lp is not None else 0.0
+    except Exception:
+        last = 0.0
+
+    if unit_cost > 0 and last > 0:
+        return (last - unit_cost) / unit_cost
+
+    return None
+
+
+# -----------------------------
+# Trading Logic (LIVE only; scheduler-ready)
+# -----------------------------
+def run_live_cycle(
     client: PublicClient,
     *,
-    mode: str,
     log_file: str,
-    equity_file: str,
-    paper_state_file: str,
-    paper_start_cash: float,
     max_trades_per_day: int,
     max_order_amount_usd: float,
+    take_profit_pct: float,
+    stop_loss_pct: float,
 ) -> None:
     symbol = "SPY"
-    amount = min(max_order_amount_usd, 10.0)
 
-    # Get quote
+    # Kill switch
+    if os.path.exists("STOP.txt"):
+        append_log(log_file, "STOPPED", details="STOP.txt detected; skipping cycle.")
+        print("STOP.txt present — bot halted.")
+        return
+
+    # Trade limit per day
+    if count_trades_today(log_file) >= max_trades_per_day:
+        append_log(log_file, "SKIP", details="Trade limit reached for today.")
+        print("SKIP: trade limit reached today.")
+        return
+
+    # Get portfolio + position
+    portfolio = client.get_portfolio_v2()
+    pos = find_equity_position(portfolio, symbol)
+    qty = get_position_qty(pos) if pos else 0.0
+    buying_power = get_buying_power_usd(portfolio)
+
+    # Get quote (for logging / reference only)
     quotes = client.get_quotes([{"symbol": symbol, "type": "EQUITY"}])
+    q = quotes["quotes"][0]
+    last = float(q["last"])
+    bid = float(q["bid"])
+    ask = float(q["ask"])
+    append_log(log_file, "QUOTE", symbol=symbol, details=f"last={last:.2f} bid={bid:.2f} ask={ask:.2f}")
 
-    try:
-        q = quotes["quotes"][0]
-        last = float(q["last"])
-        bid = float(q["bid"])
-        ask = float(q["ask"])
-        price_for_buy = ask  # conservative for market buys
-        append_log(log_file, "QUOTE", symbol=symbol, details=f"last={last:.2f} bid={bid:.2f} ask={ask:.2f}")
-    except Exception:
-        append_log(log_file, "ERROR", details=f"Could not parse quote. Raw: {str(quotes)[:300]}")
-        return
+    # If holding: use instrumentGain.gainPercentage to decide sell
+    if qty > 0 and pos is not None:
+        pnl_pct = get_unrealized_pnl_pct(pos)
 
-    # Paper equity snapshot every run
-    if mode == "paper":
-        pf = PaperPortfolio.load(paper_state_file, start_cash=paper_start_cash)
-        total = pf.total_value({symbol: price_for_buy})
-        log_paper_equity(equity_file, total_value=total, cash=pf.cash, positions=pf.positions)
-
-    # Enforce daily trade limit (paper + live)
-    trades_today = count_trades_today(log_file)
-    if trades_today >= max_trades_per_day:
-        append_log(log_file, "SKIP", details=f"Trade limit reached for today ({trades_today}).")
-        print(f"SKIP: trade limit reached. Price={price_for_buy:.2f}")
-        return
-
-    if mode == "dry":
-        append_log(
-            log_file,
-            "WOULD_BUY",
-            symbol=symbol,
-            side="BUY",
-            amount_usd=f"{amount:.2f}",
-            details=f"MODE=dry: not placing order (ref ask={price_for_buy:.2f})",
-        )
-        print(f"DRY: would buy ${amount:.2f} of {symbol} at ~{price_for_buy:.2f}")
-        return
-
-    if mode == "paper":
-        pf = PaperPortfolio.load(paper_state_file, start_cash=paper_start_cash)
-        msg = pf.buy_notional(symbol=symbol, dollars=amount, price=price_for_buy)
-        pf.save(paper_state_file)
-
-        total = pf.total_value({symbol: price_for_buy})
-        log_paper_equity(equity_file, total_value=total, cash=pf.cash, positions=pf.positions)
-
-        append_log(
-            log_file,
-            "PAPER_TRADE",
-            symbol=symbol,
-            side="BUY",
-            amount_usd=f"{amount:.2f}",
-            details=f"{msg} (fill=ask {price_for_buy:.2f})",
-        )
-        print(f"PAPER: {msg} | Fill={price_for_buy:.2f} | Total=${total:.2f} Cash=${pf.cash:.2f} Pos={pf.positions}")
-        return
-
-    if mode == "live":
-        # Guardrails for live mode
-        if amount > max_order_amount_usd:
-            append_log(log_file, "ERROR", details=f"Live trade blocked: amount {amount} > max {max_order_amount_usd}")
+        if pnl_pct is None:
+            append_log(log_file, "HOLD", symbol=symbol, details="Have position but PnL% not available; no sell decision.")
+            print("HOLD: position detected but PnL% not available.")
             return
 
-        result = client.place_market_buy_amount(symbol, amount)
         append_log(
             log_file,
-            "LIVE_ORDER",
+            "POSITION",
             symbol=symbol,
-            side="BUY",
-            amount_usd=f"{amount:.2f}",
-            order_id=result["orderId"],
-            details=f"Placed live order (ref ask={price_for_buy:.2f})",
+            details=f"qty={qty:.8f} pnl_pct={pnl_pct:.4%} last={last:.2f} bid={bid:.2f} ask={ask:.2f}",
         )
-        print("LIVE: order submitted", result["orderId"])
+
+        if pnl_pct >= take_profit_pct:
+            result = client.place_market_sell_quantity(symbol, qty)
+            append_log(
+                log_file,
+                "LIVE_SELL_SUBMITTED",
+                symbol=symbol,
+                side="SELL",
+                order_id=result["orderId"],
+                status="SUBMITTED",
+                details=f"TAKE_PROFIT pnl_pct={pnl_pct:.4%} qty={qty:.8f}",
+            )
+            print("LIVE: SELL submitted (take profit)", result["orderId"])
+            return
+
+        if pnl_pct <= -stop_loss_pct:
+            result = client.place_market_sell_quantity(symbol, qty)
+            append_log(
+                log_file,
+                "LIVE_SELL_SUBMITTED",
+                symbol=symbol,
+                side="SELL",
+                order_id=result["orderId"],
+                status="SUBMITTED",
+                details=f"STOP_LOSS pnl_pct={pnl_pct:.4%} qty={qty:.8f}",
+            )
+            print("LIVE: SELL submitted (stop loss)", result["orderId"])
+            return
+
+        print("HOLD: no exit signal.")
+        append_log(log_file, "HOLD", symbol=symbol, details="No exit signal.")
         return
 
-    append_log(log_file, "ERROR", details=f"Unknown MODE={mode}")
+    # If flat: buy if buying power allows
+    if buying_power < 1.0:
+        append_log(log_file, "SKIP", details=f"No buying power (buying_power={buying_power:.2f}).")
+        print(f"SKIP: no buying power ({buying_power:.2f})")
+        return
+
+    amount = min(max_order_amount_usd, buying_power, 10.0)
+    result = client.place_market_buy_amount(symbol, amount)
+    append_log(
+        log_file,
+        "LIVE_BUY_SUBMITTED",
+        symbol=symbol,
+        side="BUY",
+        amount_usd=f"{amount:.2f}",
+        order_id=result["orderId"],
+        status="SUBMITTED",
+        details=f"BUY amount={amount:.2f} ref_ask={ask:.2f}",
+    )
+    print("LIVE: BUY submitted", result["orderId"])
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main() -> None:
-    # Load .env FIRST so MODE/PAPER_START_CASH work from .env
     load_dotenv()
 
-    # Read runtime config from env (with safe defaults)
-    mode = os.getenv("MODE", "dry").lower()  # dry | paper | live
-    paper_start_cash = float(os.getenv("PAPER_START_CASH", "100"))
-    run_every_seconds = int(os.getenv("RUN_EVERY_SECONDS", str(60 * 60 * 24)))
-    max_order_amount_usd = float(os.getenv("MAX_ORDER_AMOUNT_USD", "10"))
+    mode = os.getenv("MODE", "live").lower()
+    if mode != "live":
+        raise RuntimeError("This version is LIVE-only. Set MODE=live in .env")
+
     max_trades_per_day = int(os.getenv("MAX_TRADES_PER_DAY", "1"))
+    max_order_amount_usd = float(os.getenv("MAX_ORDER_AMOUNT_USD", "10"))
     token_validity_minutes = int(os.getenv("TOKEN_VALIDITY_MINUTES", "15"))
 
-    # Secrets
+    take_profit_pct = float(os.getenv("TAKE_PROFIT_PCT", "0.01"))   # +1.0%
+    stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "0.007"))      # -0.7%
+
     secret = os.getenv("PUBLIC_SECRET")
     if not secret:
-        raise RuntimeError("Missing PUBLIC_SECRET in environment/.env")
+        raise RuntimeError("Missing PUBLIC_SECRET in .env")
 
-    # Create logs dir to avoid Windows locking issues in root
     ensure_dir("logs")
     log_file = os.path.join("logs", "trade_log.csv")
-    equity_file = os.path.join("logs", "paper_equity.csv")
-    paper_state_file = os.path.join("logs", "paper_state.json")
 
-    append_log(log_file, "BOT_START", details=f"Bot started. mode={mode} run_every_seconds={run_every_seconds}")
+    append_log(
+        log_file,
+        "BOT_START",
+        details=f"run-once live cycle | TP={take_profit_pct:.4f} SL={stop_loss_pct:.4f} "
+                f"max_trades_day={max_trades_per_day} max_order={max_order_amount_usd}",
+    )
 
     auth = PublicAuth(secret=secret, validity_minutes=token_validity_minutes, log_file=log_file)
     client = PublicClient(auth=auth, log_file=log_file)
 
-    # Warm-up: verify we can load accountId
     _ = client.get_account_id()
 
-    while True:
-        try:
-            run_trading_logic(
-                client,
-                mode=mode,
-                log_file=log_file,
-                equity_file=equity_file,
-                paper_state_file=paper_state_file,
-                paper_start_cash=paper_start_cash,
-                max_trades_per_day=max_trades_per_day,
-                max_order_amount_usd=max_order_amount_usd,
-            )
-        except Exception as e:
-            append_log(log_file, "ERROR", details=str(e))
-
-        time.sleep(run_every_seconds)
+    try:
+        run_live_cycle(
+            client,
+            log_file=log_file,
+            max_trades_per_day=max_trades_per_day,
+            max_order_amount_usd=max_order_amount_usd,
+            take_profit_pct=take_profit_pct,
+            stop_loss_pct=stop_loss_pct,
+        )
+    except Exception as e:
+        append_log(log_file, "ERROR", details=str(e))
+        raise
 
 
 if __name__ == "__main__":
