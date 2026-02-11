@@ -9,6 +9,9 @@ from typing import Optional, Dict, Any, List
 import requests
 from dotenv import load_dotenv
 
+# NEW: market-hours helpers (Python 3.9+)
+from zoneinfo import ZoneInfo
+
 
 # -----------------------------
 # Constants
@@ -21,6 +24,8 @@ PORTFOLIO_V2_URL_TMPL = "https://api.public.com/userapigateway/trading/{accountI
 
 ALLOWED_SYMBOLS = {"SPY"}
 
+NY_TZ = ZoneInfo("America/New_York")
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -32,6 +37,42 @@ def today_key_utc() -> str:
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+# -----------------------------
+# Market hours gate (NYSE core: Mon–Fri, 9:30–16:00 ET)
+# Note: does NOT account for holidays/early closes
+# -----------------------------
+def is_market_hours_now() -> bool:
+    now = datetime.now(NY_TZ)
+    if now.weekday() >= 5:  # Sat/Sun
+        return False
+    open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_time <= now < close_time
+
+
+def seconds_until_next_open() -> int:
+    now = datetime.now(NY_TZ)
+
+    # Weekend -> next weekday
+    while now.weekday() >= 5:
+        now = now + timedelta(days=1)
+        now = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    if now < open_time:
+        return max(0, int((open_time - now).total_seconds()))
+
+    close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now >= close_time:
+        nxt = now + timedelta(days=1)
+        while nxt.weekday() >= 5:
+            nxt = nxt + timedelta(days=1)
+        nxt_open = nxt.replace(hour=9, minute=30, second=0, microsecond=0)
+        return max(0, int((nxt_open - now).total_seconds()))
+
+    return 0
 
 
 # -----------------------------
@@ -294,7 +335,7 @@ def get_unrealized_pnl_pct(pos: Dict[str, Any]) -> Optional[float]:
 
 
 # -----------------------------
-# Trading Logic (LIVE only; scheduler-ready)
+# Trading Logic (LIVE)
 # -----------------------------
 def run_live_cycle(
     client: PublicClient,
@@ -333,7 +374,7 @@ def run_live_cycle(
     ask = float(q["ask"])
     append_log(log_file, "QUOTE", symbol=symbol, details=f"last={last:.2f} bid={bid:.2f} ask={ask:.2f}")
 
-    # If holding: use instrumentGain.gainPercentage to decide sell
+    # If holding: decide sell
     if qty > 0 and pos is not None:
         pnl_pct = get_unrealized_pnl_pct(pos)
 
@@ -402,6 +443,9 @@ def run_live_cycle(
     print("LIVE: BUY submitted", result["orderId"])
 
 
+# -----------------------------
+# Main (NOW: runs continuously during market hours)
+# -----------------------------
 def main() -> None:
     load_dotenv()
 
@@ -416,6 +460,9 @@ def main() -> None:
     take_profit_pct = float(os.getenv("TAKE_PROFIT_PCT", "0.01"))   # +1.0%
     stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "0.007"))      # -0.7%
 
+    # NEW: how often to check during market hours (default: 15 min)
+    poll_seconds = int(os.getenv("POLL_SECONDS", "900"))
+
     secret = os.getenv("PUBLIC_SECRET")
     if not secret:
         raise RuntimeError("Missing PUBLIC_SECRET in .env")
@@ -426,8 +473,8 @@ def main() -> None:
     append_log(
         log_file,
         "BOT_START",
-        details=f"run-once live cycle | TP={take_profit_pct:.4f} SL={stop_loss_pct:.4f} "
-                f"max_trades_day={max_trades_per_day} max_order={max_order_amount_usd}",
+        details=f"live loop | TP={take_profit_pct:.4f} SL={stop_loss_pct:.4f} "
+                f"max_trades_day={max_trades_per_day} max_order={max_order_amount_usd} poll={poll_seconds}s",
     )
 
     auth = PublicAuth(secret=secret, validity_minutes=token_validity_minutes, log_file=log_file)
@@ -435,18 +482,44 @@ def main() -> None:
 
     _ = client.get_account_id()
 
-    try:
-        run_live_cycle(
-            client,
-            log_file=log_file,
-            max_trades_per_day=max_trades_per_day,
-            max_order_amount_usd=max_order_amount_usd,
-            take_profit_pct=take_profit_pct,
-            stop_loss_pct=stop_loss_pct,
-        )
-    except Exception as e:
-        append_log(log_file, "ERROR", details=str(e))
-        raise
+    run_once = os.getenv("RUN_ONCE", "0").lower() in ("1", "true", "yes")
+
+    while True:
+        try:
+            if os.path.exists("STOP.txt"):
+                append_log(log_file, "STOPPED", details="STOP.txt detected; stopping main loop.")
+                print("STOP.txt present — exiting.")
+                return
+
+            if not is_market_hours_now():
+                wait = max(60, seconds_until_next_open())
+                append_log(log_file, "SLEEP", details=f"Outside market hours. Sleeping {wait}s.")
+                print(f"Outside market hours. Sleeping {wait // 60} minutes...")
+
+                # In GitHub Actions, we should EXIT if outside market hours
+                if run_once:
+                    return
+
+                time.sleep(wait)
+                continue
+
+            run_live_cycle(
+                client,
+                log_file=log_file,
+                max_trades_per_day=max_trades_per_day,
+                max_order_amount_usd=max_order_amount_usd,
+                take_profit_pct=take_profit_pct,
+                stop_loss_pct=stop_loss_pct,
+            )
+
+        except Exception as e:
+            append_log(log_file, "ERROR", details=str(e))
+
+        if run_once:
+            return
+
+        time.sleep(poll_seconds)
+
 
 
 if __name__ == "__main__":
