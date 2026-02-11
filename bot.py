@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any, List
 import requests
 from dotenv import load_dotenv
 
-# NEW: market-hours helpers (Python 3.9+)
+# market-hours helpers (Python 3.9+)
 from zoneinfo import ZoneInfo
 
 
@@ -27,6 +27,9 @@ ALLOWED_SYMBOLS = {"SPY"}
 NY_TZ = ZoneInfo("America/New_York")
 
 
+# -----------------------------
+# Time helpers
+# -----------------------------
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -40,12 +43,59 @@ def ensure_dir(path: str) -> None:
 
 
 # -----------------------------
+# Robust env parsing (fixes GitHub Actions empty-string secrets)
+# -----------------------------
+def get_env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    return raw if raw != "" else default
+
+
+def get_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def get_env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if raw == "":
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def get_env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    if raw == "":
+        return default
+    return raw in ("1", "true", "yes", "y", "on")
+
+
+# -----------------------------
 # Market hours gate (NYSE core: Mon–Fri, 9:30–16:00 ET)
 # Note: does NOT account for holidays/early closes
 # -----------------------------
 def is_market_hours_now() -> bool:
     now = datetime.now(NY_TZ)
-    if now.weekday() >= 5:  # Sat/Sun
+    if now.weekday() >= 5:
         return False
     open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
     close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -55,7 +105,7 @@ def is_market_hours_now() -> bool:
 def seconds_until_next_open() -> int:
     now = datetime.now(NY_TZ)
 
-    # Weekend -> next weekday
+    # move to weekday midnight if weekend
     while now.weekday() >= 5:
         now = now + timedelta(days=1)
         now = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -86,8 +136,16 @@ def ensure_log_header(path: str) -> None:
         w.writerow(["timestamp_utc", "event", "symbol", "side", "amount_usd", "order_id", "status", "details"])
 
 
-def append_log(log_file: str, event: str, symbol: str = "", side: str = "", amount_usd: str = "",
-               order_id: str = "", status: str = "", details: str = "") -> None:
+def append_log(
+    log_file: str,
+    event: str,
+    symbol: str = "",
+    side: str = "",
+    amount_usd: str = "",
+    order_id: str = "",
+    status: str = "",
+    details: str = "",
+) -> None:
     ensure_log_header(log_file)
     for _ in range(3):
         try:
@@ -97,6 +155,7 @@ def append_log(log_file: str, event: str, symbol: str = "", side: str = "", amou
             return
         except PermissionError:
             time.sleep(0.2)
+
     # last attempt
     with open(log_file, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -283,20 +342,6 @@ def get_buying_power_usd(portfolio: Dict[str, Any]) -> float:
     return 0.0
 
 
-def get_unit_cost(pos: Dict[str, Any]) -> float:
-    cb = pos.get("costBasis") or {}
-    for key in ("unitCost", "averageCost", "avgCost", "averagePrice"):
-        val = cb.get(key)
-        if val is not None:
-            try:
-                f = float(val)
-                if f > 0:
-                    return f
-            except Exception:
-                pass
-    return 0.0
-
-
 def get_position_qty(pos: Dict[str, Any]) -> float:
     for key in ("quantity", "qty", "shares"):
         val = pos.get(key)
@@ -311,7 +356,7 @@ def get_position_qty(pos: Dict[str, Any]) -> float:
 def get_unrealized_pnl_pct(pos: Dict[str, Any]) -> Optional[float]:
     """
     Prefer Portfolio V2's instrumentGain.gainPercentage (e.g. "-0.12" means -0.12%),
-    convert it to decimal (-0.0012). Fallback to cost basis math if needed.
+    convert it to decimal (-0.0012).
     """
     ig = pos.get("instrumentGain") or {}
     gp = ig.get("gainPercentage")
@@ -320,17 +365,6 @@ def get_unrealized_pnl_pct(pos: Dict[str, Any]) -> Optional[float]:
             return float(gp) / 100.0
         except Exception:
             pass
-
-    unit_cost = get_unit_cost(pos)
-    lp = (pos.get("lastPrice") or {}).get("lastPrice")
-    try:
-        last = float(lp) if lp is not None else 0.0
-    except Exception:
-        last = 0.0
-
-    if unit_cost > 0 and last > 0:
-        return (last - unit_cost) / unit_cost
-
     return None
 
 
@@ -360,13 +394,13 @@ def run_live_cycle(
         print("SKIP: trade limit reached today.")
         return
 
-    # Get portfolio + position
+    # Portfolio + position
     portfolio = client.get_portfolio_v2()
     pos = find_equity_position(portfolio, symbol)
     qty = get_position_qty(pos) if pos else 0.0
     buying_power = get_buying_power_usd(portfolio)
 
-    # Get quote (for logging / reference only)
+    # Quote (for logging / decisions)
     quotes = client.get_quotes([{"symbol": symbol, "type": "EQUITY"}])
     q = quotes["quotes"][0]
     last = float(q["last"])
@@ -374,7 +408,7 @@ def run_live_cycle(
     ask = float(q["ask"])
     append_log(log_file, "QUOTE", symbol=symbol, details=f"last={last:.2f} bid={bid:.2f} ask={ask:.2f}")
 
-    # If holding: decide sell
+    # If holding: decide sell based on Portfolio V2 PnL%
     if qty > 0 and pos is not None:
         pnl_pct = get_unrealized_pnl_pct(pos)
 
@@ -444,28 +478,29 @@ def run_live_cycle(
 
 
 # -----------------------------
-# Main (NOW: runs continuously during market hours)
+# Main
 # -----------------------------
 def main() -> None:
     load_dotenv()
 
-    mode = os.getenv("MODE", "live").lower()
+    mode = get_env_str("MODE", "live").lower()
     if mode != "live":
-        raise RuntimeError("This version is LIVE-only. Set MODE=live in .env")
+        raise RuntimeError("This file is LIVE-only. Set MODE=live")
 
-    max_trades_per_day = int(os.getenv("MAX_TRADES_PER_DAY", "1"))
-    max_order_amount_usd = float(os.getenv("MAX_ORDER_AMOUNT_USD", "10"))
-    token_validity_minutes = int(os.getenv("TOKEN_VALIDITY_MINUTES", "15"))
+    # SAFE env parsing (this fixes your GitHub Actions crash)
+    max_trades_per_day = get_env_int("MAX_TRADES_PER_DAY", 1)
+    max_order_amount_usd = get_env_float("MAX_ORDER_AMOUNT_USD", 10.0)
+    token_validity_minutes = get_env_int("TOKEN_VALIDITY_MINUTES", 15)
 
-    take_profit_pct = float(os.getenv("TAKE_PROFIT_PCT", "0.01"))   # +1.0%
-    stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "0.007"))      # -0.7%
+    take_profit_pct = get_env_float("TAKE_PROFIT_PCT", 0.01)  # +1.0%
+    stop_loss_pct = get_env_float("STOP_LOSS_PCT", 0.007)     # -0.7%
 
-    # NEW: how often to check during market hours (default: 15 min)
-    poll_seconds = int(os.getenv("POLL_SECONDS", "900"))
+    poll_seconds = get_env_int("POLL_SECONDS", 900)           # 15 min default
+    run_once = get_env_bool("RUN_ONCE", False)
 
     secret = os.getenv("PUBLIC_SECRET")
-    if not secret:
-        raise RuntimeError("Missing PUBLIC_SECRET in .env")
+    if not secret or secret.strip() == "":
+        raise RuntimeError("Missing PUBLIC_SECRET")
 
     ensure_dir("logs")
     log_file = os.path.join("logs", "trade_log.csv")
@@ -473,16 +508,17 @@ def main() -> None:
     append_log(
         log_file,
         "BOT_START",
-        details=f"live loop | TP={take_profit_pct:.4f} SL={stop_loss_pct:.4f} "
-                f"max_trades_day={max_trades_per_day} max_order={max_order_amount_usd} poll={poll_seconds}s",
+        details=(
+            f"live loop | TP={take_profit_pct:.4f} SL={stop_loss_pct:.4f} "
+            f"max_trades_day={max_trades_per_day} max_order={max_order_amount_usd} "
+            f"poll={poll_seconds}s run_once={run_once}"
+        ),
     )
 
     auth = PublicAuth(secret=secret, validity_minutes=token_validity_minutes, log_file=log_file)
     client = PublicClient(auth=auth, log_file=log_file)
 
     _ = client.get_account_id()
-
-    run_once = os.getenv("RUN_ONCE", "0").lower() in ("1", "true", "yes")
 
     while True:
         try:
@@ -496,7 +532,7 @@ def main() -> None:
                 append_log(log_file, "SLEEP", details=f"Outside market hours. Sleeping {wait}s.")
                 print(f"Outside market hours. Sleeping {wait // 60} minutes...")
 
-                # In GitHub Actions, we should EXIT if outside market hours
+                # In GitHub Actions (RUN_ONCE=1), exit immediately outside market hours
                 if run_once:
                     return
 
@@ -518,8 +554,7 @@ def main() -> None:
         if run_once:
             return
 
-        time.sleep(poll_seconds)
-
+        time.sleep(max(30, poll_seconds))
 
 
 if __name__ == "__main__":
