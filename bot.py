@@ -34,8 +34,9 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def today_key_utc() -> str:
-    return utcnow().strftime("%Y-%m-%d")
+def today_key_et() -> str:
+    # Use New York date for "daily" limits (matches market hours)
+    return datetime.now(NY_TZ).strftime("%Y-%m-%d")
 
 
 def ensure_dir(path: str) -> None:
@@ -87,6 +88,16 @@ def get_env_bool(name: str, default: bool = False) -> bool:
     if raw == "":
         return default
     return raw in ("1", "true", "yes", "y", "on")
+
+
+# -----------------------------
+# Console status helper (so Actions shows what happened without opening logs)
+# -----------------------------
+def print_status(event: str, details: str = "") -> None:
+    msg = f"[BOT] {event}"
+    if details:
+        msg += f" | {details}"
+    print(msg, flush=True)
 
 
 # -----------------------------
@@ -163,17 +174,41 @@ def append_log(
 
 
 def count_trades_today(log_file: str) -> int:
+    """
+    Counts today's submitted trades using the ET (New York) calendar day.
+    We store timestamp_utc, so we parse it and convert to ET for comparison.
+    """
     if not os.path.exists(log_file):
         return 0
-    tkey = today_key_utc()
+
+    tkey_et = today_key_et()
     n = 0
+
     with open(log_file, "r", newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
-            ts = row.get("timestamp_utc", "")
             ev = row.get("event", "")
-            if ts.startswith(tkey) and ev in ("LIVE_BUY_SUBMITTED", "LIVE_SELL_SUBMITTED"):
-                n += 1
+            if ev not in ("LIVE_BUY_SUBMITTED", "LIVE_SELL_SUBMITTED"):
+                continue
+
+            ts = (row.get("timestamp_utc", "") or "").strip()
+            if not ts:
+                continue
+
+            # Robust ISO parse (handles "...Z" and "+00:00")
+            try:
+                ts_norm = ts.replace("Z", "+00:00")
+                dt_utc = datetime.fromisoformat(ts_norm)
+                if dt_utc.tzinfo is None:
+                    dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+                dt_et = dt_utc.astimezone(NY_TZ)
+                if dt_et.strftime("%Y-%m-%d") == tkey_et:
+                    n += 1
+            except Exception:
+                # if parse fails, fall back to old behavior (best-effort)
+                if ts.startswith(tkey_et):
+                    n += 1
+
     return n
 
 
@@ -209,6 +244,7 @@ class PublicAuth:
         if self._access is None or utcnow() >= self._access.expires_at_utc:
             self._access = self._fetch_token()
             append_log(self.log_file, "TOKEN_REFRESHED", details="New access token obtained (not logged).")
+            print_status("TOKEN_REFRESHED")
         return self._access.token
 
     def auth_headers(self) -> Dict[str, str]:
@@ -219,9 +255,10 @@ class PublicAuth:
 # Public API Client
 # -----------------------------
 class PublicClient:
-    def __init__(self, auth: PublicAuth, log_file: str):
+    def __init__(self, auth: PublicAuth, log_file: str, *, dry_run: bool = False):
         self.auth = auth
         self.log_file = log_file
+        self.dry_run = dry_run
         self._account_id: Optional[str] = None
 
     def get_account_id(self) -> str:
@@ -235,6 +272,7 @@ class PublicClient:
             raise RuntimeError("No accounts returned from Public.")
         self._account_id = accounts[0]["accountId"]
         append_log(self.log_file, "ACCOUNT_LOADED", details="accountId loaded.")
+        print_status("ACCOUNT_LOADED")
         return self._account_id
 
     def get_quotes(self, instruments: List[Dict[str, str]]) -> Dict[str, Any]:
@@ -256,9 +294,9 @@ class PublicClient:
         resp.raise_for_status()
         return resp.json()
 
-    @staticmethod
-    def deterministic_order_id(account_id: str, side: str, symbol: str) -> str:
-        seed = f"{account_id}:{today_key_utc()}:{side}:{symbol}"
+    def deterministic_order_id(self, account_id: str, side: str, symbol: str) -> str:
+        # Use ET day so BUY/SELL order IDs align with market-day logic
+        seed = f"{account_id}:{today_key_et()}:{side}:{symbol}"
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
     def place_market_buy_amount(self, symbol: str, amount_usd: float) -> Dict[str, Any]:
@@ -279,6 +317,9 @@ class PublicClient:
             "expiration": {"timeInForce": "DAY"},
             "amount": f"{amount_usd:.2f}",
         }
+
+        if self.dry_run:
+            return {"orderId": order_id, "response": {"dry_run": True, "payload": payload}}
 
         resp = requests.post(
             url,
@@ -307,6 +348,9 @@ class PublicClient:
             "expiration": {"timeInForce": "DAY"},
             "quantity": f"{quantity:.8f}",
         }
+
+        if self.dry_run:
+            return {"orderId": order_id, "response": {"dry_run": True, "payload": payload}}
 
         resp = requests.post(
             url,
@@ -385,13 +429,14 @@ def run_live_cycle(
     # Kill switch
     if os.path.exists("STOP.txt"):
         append_log(log_file, "STOPPED", details="STOP.txt detected; skipping cycle.")
-        print("STOP.txt present — bot halted.")
+        print_status("STOPPED", "STOP.txt detected; skipping cycle")
         return
 
     # Trade limit per day
-    if count_trades_today(log_file) >= max_trades_per_day:
+    trades_today = count_trades_today(log_file)
+    if trades_today >= max_trades_per_day:
         append_log(log_file, "SKIP", details="Trade limit reached for today.")
-        print("SKIP: trade limit reached today.")
+        print_status("SKIP", f"trade limit reached (trades_today={trades_today}, limit={max_trades_per_day})")
         return
 
     # Portfolio + position
@@ -400,6 +445,17 @@ def run_live_cycle(
     qty = get_position_qty(pos) if pos else 0.0
     buying_power = get_buying_power_usd(portfolio)
 
+    append_log(
+        log_file,
+        "DECISION",
+        symbol=symbol,
+        details=(
+            f"qty={qty:.8f} buying_power={buying_power:.2f} "
+            f"tp={take_profit_pct:.4%} sl={stop_loss_pct:.4%} "
+            f"trades_today={trades_today}/{max_trades_per_day} dry_run={client.dry_run}"
+        ),
+    )
+
     # Quote (for logging / decisions)
     quotes = client.get_quotes([{"symbol": symbol, "type": "EQUITY"}])
     q = quotes["quotes"][0]
@@ -407,6 +463,7 @@ def run_live_cycle(
     bid = float(q["bid"])
     ask = float(q["ask"])
     append_log(log_file, "QUOTE", symbol=symbol, details=f"last={last:.2f} bid={bid:.2f} ask={ask:.2f}")
+    print_status("QUOTE", f"{symbol} last={last:.2f} bid={bid:.2f} ask={ask:.2f}")
 
     # If holding: decide sell based on Portfolio V2 PnL%
     if qty > 0 and pos is not None:
@@ -414,7 +471,7 @@ def run_live_cycle(
 
         if pnl_pct is None:
             append_log(log_file, "HOLD", symbol=symbol, details="Have position but PnL% not available; no sell decision.")
-            print("HOLD: position detected but PnL% not available.")
+            print_status("HOLD", "position detected but PnL% not available")
             return
 
         append_log(
@@ -423,6 +480,7 @@ def run_live_cycle(
             symbol=symbol,
             details=f"qty={qty:.8f} pnl_pct={pnl_pct:.4%} last={last:.2f} bid={bid:.2f} ask={ask:.2f}",
         )
+        print_status("POSITION", f"qty={qty:.8f} pnl_pct={pnl_pct:.2%}")
 
         if pnl_pct >= take_profit_pct:
             result = client.place_market_sell_quantity(symbol, qty)
@@ -432,10 +490,10 @@ def run_live_cycle(
                 symbol=symbol,
                 side="SELL",
                 order_id=result["orderId"],
-                status="SUBMITTED",
+                status="SUBMITTED" if not client.dry_run else "DRY_RUN",
                 details=f"TAKE_PROFIT pnl_pct={pnl_pct:.4%} qty={qty:.8f}",
             )
-            print("LIVE: SELL submitted (take profit)", result["orderId"])
+            print_status("SELL_SUBMITTED", f"TAKE_PROFIT order_id={result['orderId']} qty={qty:.8f} pnl={pnl_pct:.2%}")
             return
 
         if pnl_pct <= -stop_loss_pct:
@@ -446,20 +504,20 @@ def run_live_cycle(
                 symbol=symbol,
                 side="SELL",
                 order_id=result["orderId"],
-                status="SUBMITTED",
+                status="SUBMITTED" if not client.dry_run else "DRY_RUN",
                 details=f"STOP_LOSS pnl_pct={pnl_pct:.4%} qty={qty:.8f}",
             )
-            print("LIVE: SELL submitted (stop loss)", result["orderId"])
+            print_status("SELL_SUBMITTED", f"STOP_LOSS order_id={result['orderId']} qty={qty:.8f} pnl={pnl_pct:.2%}")
             return
 
-        print("HOLD: no exit signal.")
         append_log(log_file, "HOLD", symbol=symbol, details="No exit signal.")
+        print_status("HOLD", "no exit signal")
         return
 
     # If flat: buy if buying power allows
     if buying_power < 1.0:
         append_log(log_file, "SKIP", details=f"No buying power (buying_power={buying_power:.2f}).")
-        print(f"SKIP: no buying power ({buying_power:.2f})")
+        print_status("SKIP", f"no buying power ({buying_power:.2f})")
         return
 
     amount = min(max_order_amount_usd, buying_power, 10.0)
@@ -471,10 +529,10 @@ def run_live_cycle(
         side="BUY",
         amount_usd=f"{amount:.2f}",
         order_id=result["orderId"],
-        status="SUBMITTED",
+        status="SUBMITTED" if not client.dry_run else "DRY_RUN",
         details=f"BUY amount={amount:.2f} ref_ask={ask:.2f}",
     )
-    print("LIVE: BUY submitted", result["orderId"])
+    print_status("BUY_SUBMITTED", f"order_id={result['orderId']} amount=${amount:.2f}")
 
 
 # -----------------------------
@@ -498,6 +556,9 @@ def main() -> None:
     poll_seconds = get_env_int("POLL_SECONDS", 900)           # 15 min default
     run_once = get_env_bool("RUN_ONCE", False)
 
+    # NEW: safety switch
+    dry_run = get_env_bool("DRY_RUN", False)
+
     secret = os.getenv("PUBLIC_SECRET")
     if not secret or secret.strip() == "":
         raise RuntimeError("Missing PUBLIC_SECRET")
@@ -511,12 +572,18 @@ def main() -> None:
         details=(
             f"live loop | TP={take_profit_pct:.4f} SL={stop_loss_pct:.4f} "
             f"max_trades_day={max_trades_per_day} max_order={max_order_amount_usd} "
-            f"poll={poll_seconds}s run_once={run_once}"
+            f"poll={poll_seconds}s run_once={run_once} dry_run={dry_run}"
         ),
+    )
+    print_status(
+        "BOT_START",
+        f"TP={take_profit_pct:.2%} SL={stop_loss_pct:.2%} "
+        f"max_trades_day={max_trades_per_day} max_order=${max_order_amount_usd:.2f} "
+        f"poll={poll_seconds}s run_once={run_once} dry_run={dry_run}",
     )
 
     auth = PublicAuth(secret=secret, validity_minutes=token_validity_minutes, log_file=log_file)
-    client = PublicClient(auth=auth, log_file=log_file)
+    client = PublicClient(auth=auth, log_file=log_file, dry_run=dry_run)
 
     _ = client.get_account_id()
 
@@ -524,13 +591,13 @@ def main() -> None:
         try:
             if os.path.exists("STOP.txt"):
                 append_log(log_file, "STOPPED", details="STOP.txt detected; stopping main loop.")
-                print("STOP.txt present — exiting.")
+                print_status("STOPPED", "STOP.txt detected; exiting")
                 return
 
             if not is_market_hours_now():
                 wait = max(60, seconds_until_next_open())
                 append_log(log_file, "SLEEP", details=f"Outside market hours. Sleeping {wait}s.")
-                print(f"Outside market hours. Sleeping {wait // 60} minutes...")
+                print_status("SLEEP", f"outside market hours; next open in {wait // 60} min")
 
                 # In GitHub Actions (RUN_ONCE=1), exit immediately outside market hours
                 if run_once:
@@ -550,6 +617,7 @@ def main() -> None:
 
         except Exception as e:
             append_log(log_file, "ERROR", details=str(e))
+            print_status("ERROR", str(e))
 
         if run_once:
             return
