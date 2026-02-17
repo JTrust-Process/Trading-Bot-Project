@@ -31,17 +31,31 @@ jobs:
           MODE: "live"
           RUN_ONCE: "1"
 
+          # REQUIRED
           PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
 
-          MAX_TRADES_PER_DAY: ${{ secrets.MAX_TRADES_PER_DAY }}
-          MAX_ORDER_AMOUNT_USD: ${{ secrets.MAX_ORDER_AMOUNT_USD }}
-          TAKE_PROFIT_PCT: ${{ secrets.TAKE_PROFIT_PCT }}
-          STOP_LOSS_PCT: ${{ secrets.STOP_LOSS_PCT }}
+          # Growth config (hardcoded here instead of secrets)
+          MAX_TRADES_PER_DAY: "3"
+          MAX_ORDER_AMOUNT_USD: "10"
+          TAKE_PROFIT_PCT: "0.03"
+          STOP_LOSS_PCT: "0.02"
 
-          # Optional: for logs / timezone clarity
+          WITHDRAW_DATE: "2026-05-10"
+          LOCKDOWN_DAYS: "14"
+
+          SYMBOLS: "ABBV,BX,CMCSA,COP,CVX,DUK,ITOT,IVV,JNJ,KO,LMT,MDT,MO,PEP,PM,PNC,QQQ,SBUX,SCHB,SCHD,SGOV,SO,SPY,TXN,VOO,VTI,VXUS,VZ,WMB,XOM"
+
+          MAX_EXPOSURE_EARLY: "0.90"
+          MAX_EXPOSURE_MID: "0.75"
+          MAX_EXPOSURE_LATE: "0.50"
+
+          MAX_DRAWDOWN: "0.08"
+          DAILY_LOSS_LIMIT: "0.03"
+
           TZ: "America/New_York"
         run: |
           python bot.py
+
 
       - name: Upload logs
         if: always()
