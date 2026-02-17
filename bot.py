@@ -2,19 +2,17 @@ import os
 import time
 import uuid
 import csv
+import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta, timezone, date
+from typing import Optional, Dict, Any, List, Tuple
 
 import requests
 from dotenv import load_dotenv
-
-# market-hours helpers (Python 3.9+)
 from zoneinfo import ZoneInfo
 
-
 # -----------------------------
-# Constants
+# Constants / Config
 # -----------------------------
 AUTH_URL = "https://api.public.com/userapiauthservice/personal/access-tokens"
 ACCOUNT_URL = "https://api.public.com/userapigateway/trading/account"
@@ -22,9 +20,9 @@ QUOTES_URL_TMPL = "https://api.public.com/userapigateway/marketdata/{accountId}/
 ORDER_URL_TMPL = "https://api.public.com/userapigateway/trading/{accountId}/order"
 PORTFOLIO_V2_URL_TMPL = "https://api.public.com/userapigateway/trading/{accountId}/portfolio/v2"
 
-ALLOWED_SYMBOLS = {"SPY"}
-
 NY_TZ = ZoneInfo("America/New_York")
+STATE_FILE = "state.json"
+STOP_FILE = "STOP.txt"
 
 
 # -----------------------------
@@ -35,75 +33,21 @@ def utcnow() -> datetime:
 
 
 def today_key_et() -> str:
-    # Use New York date for "daily" limits (matches market hours)
     return datetime.now(NY_TZ).strftime("%Y-%m-%d")
+
+
+def today_date_et() -> date:
+    return datetime.now(NY_TZ).date()
 
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-# -----------------------------
-# Robust env parsing (fixes GitHub Actions empty-string secrets)
-# -----------------------------
-def get_env_str(name: str, default: str) -> str:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    raw = raw.strip()
-    return raw if raw != "" else default
+def parse_date_ymd(s: str) -> date:
+    return datetime.strptime(s.strip(), "%Y-%m-%d").date()
 
 
-def get_env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    raw = raw.strip()
-    if raw == "":
-        return default
-    try:
-        return int(raw)
-    except Exception:
-        return default
-
-
-def get_env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    raw = raw.strip()
-    if raw == "":
-        return default
-    try:
-        return float(raw)
-    except Exception:
-        return default
-
-
-def get_env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    raw = raw.strip().lower()
-    if raw == "":
-        return default
-    return raw in ("1", "true", "yes", "y", "on")
-
-
-# -----------------------------
-# Console status helper (so Actions shows what happened without opening logs)
-# -----------------------------
-def print_status(event: str, details: str = "") -> None:
-    msg = f"[BOT] {event}"
-    if details:
-        msg += f" | {details}"
-    print(msg, flush=True)
-
-
-# -----------------------------
-# Market hours gate (NYSE core: Mon–Fri, 9:30–16:00 ET)
-# Note: does NOT account for holidays/early closes
-# -----------------------------
 def is_market_hours_now() -> bool:
     now = datetime.now(NY_TZ)
     if now.weekday() >= 5:
@@ -116,7 +60,7 @@ def is_market_hours_now() -> bool:
 def seconds_until_next_open() -> int:
     now = datetime.now(NY_TZ)
 
-    # move to weekday midnight if weekend
+    # move to next weekday midnight if weekend
     while now.weekday() >= 5:
         now = now + timedelta(days=1)
         now = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -137,7 +81,67 @@ def seconds_until_next_open() -> int:
 
 
 # -----------------------------
-# Logging (CSV) with Windows-safe retry
+# Env parsing
+# -----------------------------
+def get_env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    return raw if raw else default
+
+
+def get_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def get_env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def get_env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "y", "on")
+
+
+def parse_symbols_env() -> List[str]:
+    raw = get_env_str("SYMBOLS", "SPY")
+    syms = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    # de-dupe while preserving order
+    out = []
+    seen = set()
+    for s in syms:
+        if s not in seen:
+            out.append(s)
+            seen.add(s)
+    return out
+
+
+# -----------------------------
+# Logging (CSV)
 # -----------------------------
 def ensure_log_header(path: str) -> None:
     if os.path.exists(path):
@@ -150,6 +154,7 @@ def ensure_log_header(path: str) -> None:
 def append_log(
     log_file: str,
     event: str,
+    *,
     symbol: str = "",
     side: str = "",
     amount_usd: str = "",
@@ -158,26 +163,19 @@ def append_log(
     details: str = "",
 ) -> None:
     ensure_log_header(log_file)
-    for _ in range(3):
-        try:
-            with open(log_file, "a", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow([utcnow().isoformat(), event, symbol, side, amount_usd, order_id, status, details])
-            return
-        except PermissionError:
-            time.sleep(0.2)
-
-    # last attempt
     with open(log_file, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([utcnow().isoformat(), event, symbol, side, amount_usd, order_id, status, details])
 
 
+def print_status(event: str, details: str = "") -> None:
+    msg = f"[BOT] {event}"
+    if details:
+        msg += f" | {details}"
+    print(msg, flush=True)
+
+
 def count_trades_today(log_file: str) -> int:
-    """
-    Counts today's submitted trades using the ET (New York) calendar day.
-    We store timestamp_utc, so we parse it and convert to ET for comparison.
-    """
     if not os.path.exists(log_file):
         return 0
 
@@ -187,7 +185,7 @@ def count_trades_today(log_file: str) -> int:
     with open(log_file, "r", newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
-            ev = row.get("event", "")
+            ev = (row.get("event", "") or "").strip()
             if ev not in ("LIVE_BUY_SUBMITTED", "LIVE_SELL_SUBMITTED"):
                 continue
 
@@ -195,7 +193,6 @@ def count_trades_today(log_file: str) -> int:
             if not ts:
                 continue
 
-            # Robust ISO parse (handles "...Z" and "+00:00")
             try:
                 ts_norm = ts.replace("Z", "+00:00")
                 dt_utc = datetime.fromisoformat(ts_norm)
@@ -205,11 +202,67 @@ def count_trades_today(log_file: str) -> int:
                 if dt_et.strftime("%Y-%m-%d") == tkey_et:
                     n += 1
             except Exception:
-                # if parse fails, fall back to old behavior (best-effort)
+                # fallback (best-effort)
                 if ts.startswith(tkey_et):
                     n += 1
 
     return n
+
+
+# -----------------------------
+# State (per-symbol)
+# -----------------------------
+def load_state() -> Dict[str, Any]:
+    if not os.path.exists(STATE_FILE):
+        return {"symbols": {}}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        if "symbols" not in data or not isinstance(data["symbols"], dict):
+            data["symbols"] = {}
+        return data
+    except Exception:
+        return {"symbols": {}}
+
+
+def save_state(state: Dict[str, Any]) -> None:
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, STATE_FILE)
+
+
+# -----------------------------
+# Withdrawal glide path / exposure caps (portfolio-level)
+# -----------------------------
+def parse_withdraw_date_env() -> Optional[date]:
+    raw = os.getenv("WITHDRAW_DATE")
+    if not raw:
+        return None
+    raw = raw.strip()
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except Exception:
+        raise RuntimeError("WITHDRAW_DATE must be YYYY-MM-DD (e.g., 2026-05-17)")
+
+
+def days_until_withdraw(withdraw_date: Optional[date]) -> Optional[int]:
+    if not withdraw_date:
+        return None
+    return (withdraw_date - today_date_et()).days
+
+
+def compute_max_exposure(days_left: Optional[int], *, early: float, mid: float, late: float, lockdown_days: int) -> float:
+    # Total portfolio exposure cap target (not per-symbol).
+    if days_left is None:
+        return early
+    if days_left <= lockdown_days:
+        return 0.0
+    if days_left <= 30:
+        return late
+    if days_left <= 60:
+        return mid
+    return early
 
 
 # -----------------------------
@@ -275,6 +328,13 @@ class PublicClient:
         print_status("ACCOUNT_LOADED")
         return self._account_id
 
+    def get_portfolio_v2(self) -> Dict[str, Any]:
+        account_id = self.get_account_id()
+        url = PORTFOLIO_V2_URL_TMPL.format(accountId=account_id)
+        resp = requests.get(url, headers=self.auth.auth_headers(), timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
     def get_quotes(self, instruments: List[Dict[str, str]]) -> Dict[str, Any]:
         account_id = self.get_account_id()
         url = QUOTES_URL_TMPL.format(accountId=account_id)
@@ -287,52 +347,11 @@ class PublicClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_portfolio_v2(self) -> Dict[str, Any]:
-        account_id = self.get_account_id()
-        url = PORTFOLIO_V2_URL_TMPL.format(accountId=account_id)
-        resp = requests.get(url, headers=self.auth.auth_headers(), timeout=30)
-        resp.raise_for_status()
-        return resp.json()
-
     def deterministic_order_id(self, account_id: str, side: str, symbol: str) -> str:
-        # Use ET day so BUY/SELL order IDs align with market-day logic
         seed = f"{account_id}:{today_key_et()}:{side}:{symbol}"
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
-    def place_market_buy_amount(self, symbol: str, amount_usd: float) -> Dict[str, Any]:
-        if symbol not in ALLOWED_SYMBOLS:
-            raise ValueError(f"Symbol {symbol} not in ALLOWED_SYMBOLS.")
-        if amount_usd <= 0:
-            raise ValueError("amount_usd must be > 0")
-
-        account_id = self.get_account_id()
-        url = ORDER_URL_TMPL.format(accountId=account_id)
-        order_id = self.deterministic_order_id(account_id, "BUY", symbol)
-
-        payload = {
-            "orderId": order_id,
-            "instrument": {"symbol": symbol, "type": "EQUITY"},
-            "orderSide": "BUY",
-            "orderType": "MARKET",
-            "expiration": {"timeInForce": "DAY"},
-            "amount": f"{amount_usd:.2f}",
-        }
-
-        if self.dry_run:
-            return {"orderId": order_id, "response": {"dry_run": True, "payload": payload}}
-
-        resp = requests.post(
-            url,
-            headers={**self.auth.auth_headers(), "Content-Type": "application/json"},
-            json=payload,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return {"orderId": order_id, "response": resp.json()}
-
     def place_market_sell_quantity(self, symbol: str, quantity: float) -> Dict[str, Any]:
-        if symbol not in ALLOWED_SYMBOLS:
-            raise ValueError(f"Symbol {symbol} not in ALLOWED_SYMBOLS.")
         if quantity <= 0:
             raise ValueError("quantity must be > 0")
 
@@ -363,13 +382,12 @@ class PublicClient:
 
 
 # -----------------------------
-# Helpers to read portfolio
+# Portfolio helpers
 # -----------------------------
 def find_equity_position(portfolio: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
-    positions = portfolio.get("positions") or []
-    for p in positions:
-        inst = (p.get("instrument") or {})
-        if inst.get("symbol") == symbol and inst.get("type") == "EQUITY":
+    for p in (portfolio.get("positions") or []):
+        inst = p.get("instrument") or {}
+        if inst.get("type") == "EQUITY" and (inst.get("symbol") or "").upper() == symbol.upper():
             return p
     return None
 
@@ -377,162 +395,397 @@ def find_equity_position(portfolio: Dict[str, Any], symbol: str) -> Optional[Dic
 def get_buying_power_usd(portfolio: Dict[str, Any]) -> float:
     bp = portfolio.get("buyingPower") or {}
     for key in ("cashOnlyBuyingPower", "buyingPower", "availableBuyingPower"):
-        val = bp.get(key)
-        if val is not None:
+        v = bp.get(key)
+        if v is not None:
             try:
-                return float(val)
+                return float(v)
             except Exception:
                 pass
     return 0.0
+
+
+def get_total_equity_usd(portfolio: Dict[str, Any]) -> float:
+    total = 0.0
+    for item in (portfolio.get("equity") or []):
+        try:
+            total += float(item.get("value", 0.0) or 0.0)
+        except Exception:
+            pass
+    return float(total)
 
 
 def get_position_qty(pos: Dict[str, Any]) -> float:
     for key in ("quantity", "qty", "shares"):
-        val = pos.get(key)
-        if val is not None:
+        v = pos.get(key)
+        if v is not None:
             try:
-                return float(val)
+                return float(v)
             except Exception:
                 pass
     return 0.0
 
 
-def get_unrealized_pnl_pct(pos: Dict[str, Any]) -> Optional[float]:
-    """
-    Prefer Portfolio V2's instrumentGain.gainPercentage (e.g. "-0.12" means -0.12%),
-    convert it to decimal (-0.0012).
-    """
-    ig = pos.get("instrumentGain") or {}
-    gp = ig.get("gainPercentage")
-    if gp is not None:
+def get_position_value_usd(pos: Dict[str, Any]) -> float:
+    v = pos.get("currentValue")
+    if v is not None:
         try:
-            return float(gp) / 100.0
+            return float(v)
         except Exception:
             pass
-    return None
+
+    # fallback: qty * lastPrice.lastPrice
+    try:
+        qty = float(pos.get("quantity", 0.0) or 0.0)
+        lp = pos.get("lastPrice") or {}
+        px = float(lp.get("lastPrice", 0.0) or 0.0)
+        return qty * px
+    except Exception:
+        return 0.0
+
+
+def get_unrealized_pnl_pct(pos: Dict[str, Any]) -> Optional[float]:
+    ig = pos.get("instrumentGain") or {}
+    gp = ig.get("gainPercentage")
+    if gp is None:
+        return None
+    try:
+        return float(gp) / 100.0
+    except Exception:
+        return None
+
+
+def get_last_price(pos: Dict[str, Any]) -> Optional[float]:
+    lp = pos.get("lastPrice") or {}
+    v = lp.get("lastPrice")
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
 
 
 # -----------------------------
-# Trading Logic (LIVE)
+# Per-symbol risk state helpers (position-value based)
+# -----------------------------
+def sym_state(state: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    state.setdefault("symbols", {})
+    s = state["symbols"].setdefault(symbol, {})
+    if "day_key_et" not in s:
+        s["day_key_et"] = ""
+    if "day_start_value" not in s:
+        s["day_start_value"] = 0.0
+    if "peak_value" not in s:
+        s["peak_value"] = 0.0
+    if "halt_until_day_key_et" not in s:
+        s["halt_until_day_key_et"] = ""
+    return s
+
+
+def should_halt_symbol(sstate: Dict[str, Any]) -> bool:
+    halt_key = (sstate.get("halt_until_day_key_et") or "").strip()
+    if not halt_key:
+        return False
+    # halt for the whole day key
+    return today_key_et() <= halt_key
+
+
+# -----------------------------
+# Trading Logic (LIVE) - manage existing portfolio only
 # -----------------------------
 def run_live_cycle(
     client: PublicClient,
     *,
     log_file: str,
+    symbols: List[str],
     max_trades_per_day: int,
-    max_order_amount_usd: float,
     take_profit_pct: float,
     stop_loss_pct: float,
+    withdraw_date: Optional[date],
+    lockdown_days: int,
+    max_exposure_early: float,
+    max_exposure_mid: float,
+    max_exposure_late: float,
+    max_drawdown: float,
+    daily_loss_limit: float,
 ) -> None:
-    symbol = "SPY"
-
-    # Kill switch
-    if os.path.exists("STOP.txt"):
-        append_log(log_file, "STOPPED", details="STOP.txt detected; skipping cycle.")
-        print_status("STOPPED", "STOP.txt detected; skipping cycle")
+    if os.path.exists(STOP_FILE):
+        append_log(log_file, "STOPPED", details=f"{STOP_FILE} detected; skipping cycle.")
+        print_status("STOPPED", f"{STOP_FILE} detected; skipping cycle")
         return
 
-    # Trade limit per day
+    # Trade limit (global)
     trades_today = count_trades_today(log_file)
     if trades_today >= max_trades_per_day:
         append_log(log_file, "SKIP", details="Trade limit reached for today.")
         print_status("SKIP", f"trade limit reached (trades_today={trades_today}, limit={max_trades_per_day})")
         return
 
-    # Portfolio + position
+    state = load_state()
+
+    # Portfolio snapshot
     portfolio = client.get_portfolio_v2()
-    pos = find_equity_position(portfolio, symbol)
-    qty = get_position_qty(pos) if pos else 0.0
+    total_equity = get_total_equity_usd(portfolio)
     buying_power = get_buying_power_usd(portfolio)
+
+    # Glide-path cap is portfolio-level
+    days_left = days_until_withdraw(withdraw_date)
+    cap_total = compute_max_exposure(
+        days_left,
+        early=max_exposure_early,
+        mid=max_exposure_mid,
+        late=max_exposure_late,
+        lockdown_days=lockdown_days,
+    )
+
+    # Build current symbol snapshots
+    snapshots: List[Dict[str, Any]] = []
+    total_pos_value = 0.0
+
+    for sym in symbols:
+        pos = find_equity_position(portfolio, sym)
+        if not pos:
+            # if you don't hold it, we do nothing (you said: no buys for non-owned)
+            continue
+
+        qty = get_position_qty(pos)
+        if qty <= 0:
+            continue
+
+        pos_value = get_position_value_usd(pos)
+        pnl_pct = get_unrealized_pnl_pct(pos)
+        last_px = get_last_price(pos)
+
+        snapshots.append({
+            "symbol": sym,
+            "pos": pos,
+            "qty": float(qty),
+            "value": float(pos_value),
+            "pnl_pct": pnl_pct,   # may be None
+            "last": last_px,      # may be None
+        })
+        total_pos_value += float(pos_value)
+
+    total_exposure = (total_pos_value / total_equity) if total_equity > 0 else 0.0
 
     append_log(
         log_file,
-        "DECISION",
-        symbol=symbol,
-        details=(
-            f"qty={qty:.8f} buying_power={buying_power:.2f} "
-            f"tp={take_profit_pct:.4%} sl={stop_loss_pct:.4%} "
-            f"trades_today={trades_today}/{max_trades_per_day} dry_run={client.dry_run}"
-        ),
+        "PORTFOLIO",
+        details=f"equity={total_equity:.2f} pos_value={total_pos_value:.2f} exposure={total_exposure:.2%} "
+                f"bp={buying_power:.2f} days_left={days_left} cap_total={cap_total:.2%}",
+    )
+    print_status(
+        "PORTFOLIO",
+        f"equity={total_equity:.2f} exposure={total_exposure:.2%} cap_total={cap_total:.2%} days_left={days_left}",
     )
 
-    # Quote (for logging / decisions)
-    quotes = client.get_quotes([{"symbol": symbol, "type": "EQUITY"}])
-    q = quotes["quotes"][0]
-    last = float(q["last"])
-    bid = float(q["bid"])
-    ask = float(q["ask"])
-    append_log(log_file, "QUOTE", symbol=symbol, details=f"last={last:.2f} bid={bid:.2f} ask={ask:.2f}")
-    print_status("QUOTE", f"{symbol} last={last:.2f} bid={bid:.2f} ask={ask:.2f}")
+    # Hard lockdown: sell everything we manage
+    in_lockdown = (days_left is not None and days_left <= lockdown_days)
+    if in_lockdown and snapshots:
+        for snap in snapshots:
+            if trades_today >= max_trades_per_day:
+                break
+            sym = snap["symbol"]
+            qty = snap["qty"]
+            result = client.place_market_sell_quantity(sym, qty)
+            trades_today += 1
+            append_log(
+                log_file,
+                "LIVE_SELL_SUBMITTED",
+                symbol=sym,
+                side="SELL",
+                order_id=result["orderId"],
+                status="SUBMITTED" if not client.dry_run else "DRY_RUN",
+                details=f"LOCKDOWN days_left={days_left} qty={qty:.8f}",
+            )
+            print_status("SELL_SUBMITTED", f"{sym} LOCKDOWN qty={qty:.8f}")
+        save_state(state)
+        return
 
-    # If holding: decide sell based on Portfolio V2 PnL%
-    if qty > 0 and pos is not None:
-        pnl_pct = get_unrealized_pnl_pct(pos)
+    # 1) Per-symbol TP/SL + per-symbol kill-switches (independent)
+    for snap in snapshots:
+        if trades_today >= max_trades_per_day:
+            break
 
-        if pnl_pct is None:
-            append_log(log_file, "HOLD", symbol=symbol, details="Have position but PnL% not available; no sell decision.")
-            print_status("HOLD", "position detected but PnL% not available")
-            return
+        sym = snap["symbol"]
+        qty = snap["qty"]
+        pos_value = snap["value"]
+        pnl_pct = snap["pnl_pct"]
+
+        sstate = sym_state(state, sym)
+
+        # initialize / roll day
+        dkey = today_key_et()
+        if sstate.get("day_key_et") != dkey:
+            sstate["day_key_et"] = dkey
+            sstate["day_start_value"] = float(pos_value)
+            # peak_value is persistent per symbol (do not reset daily)
+            if float(sstate.get("peak_value") or 0.0) <= 0:
+                sstate["peak_value"] = float(pos_value)
+            # clear halt if it was for previous day
+            if (sstate.get("halt_until_day_key_et") or "") < dkey:
+                sstate["halt_until_day_key_et"] = ""
+
+        # halt check (per symbol)
+        if should_halt_symbol(sstate):
+            append_log(log_file, "SKIP", symbol=sym, details=f"HALTED (until_day_key={sstate.get('halt_until_day_key_et')})")
+            print_status("SKIP", f"{sym} halted until {sstate.get('halt_until_day_key_et')}")
+            continue
+
+        # update peak/drawdown based on position value
+        peak = float(sstate.get("peak_value") or 0.0)
+        peak = max(peak, float(pos_value))
+        sstate["peak_value"] = peak
+
+        dd = (1.0 - float(pos_value) / peak) if peak > 0 else 0.0
+        start_val = float(sstate.get("day_start_value") or float(pos_value) or 0.0)
+        daily_ret = (float(pos_value) / start_val - 1.0) if start_val > 0 else 0.0
 
         append_log(
             log_file,
-            "POSITION",
-            symbol=symbol,
-            details=f"qty={qty:.8f} pnl_pct={pnl_pct:.4%} last={last:.2f} bid={bid:.2f} ask={ask:.2f}",
+            "SYMBOL_STATE",
+            symbol=sym,
+            details=f"value={pos_value:.2f} pnl_pct={(pnl_pct if pnl_pct is not None else float('nan'))} "
+                    f"daily_ret={daily_ret:.2%} dd={dd:.2%} peak={peak:.2f} start={start_val:.2f}",
         )
-        print_status("POSITION", f"qty={qty:.8f} pnl_pct={pnl_pct:.2%}")
 
-        if pnl_pct >= take_profit_pct:
-            result = client.place_market_sell_quantity(symbol, qty)
+        # Per-symbol kill switches: sell + halt rest of day
+        if daily_loss_limit > 0 and daily_ret <= -daily_loss_limit:
+            result = client.place_market_sell_quantity(sym, qty)
+            trades_today += 1
             append_log(
                 log_file,
                 "LIVE_SELL_SUBMITTED",
-                symbol=symbol,
+                symbol=sym,
                 side="SELL",
                 order_id=result["orderId"],
                 status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"TAKE_PROFIT pnl_pct={pnl_pct:.4%} qty={qty:.8f}",
+                details=f"DAILY_LOSS_LIMIT hit daily_ret={daily_ret:.4%} qty={qty:.8f}",
             )
-            print_status("SELL_SUBMITTED", f"TAKE_PROFIT order_id={result['orderId']} qty={qty:.8f} pnl={pnl_pct:.2%}")
-            return
+            print_status("SELL_SUBMITTED", f"{sym} DAILY_LOSS_LIMIT qty={qty:.8f} daily={daily_ret:.2%}")
+            sstate["halt_until_day_key_et"] = today_key_et()
+            continue
 
-        if pnl_pct <= -stop_loss_pct:
-            result = client.place_market_sell_quantity(symbol, qty)
+        if max_drawdown > 0 and dd >= max_drawdown:
+            result = client.place_market_sell_quantity(sym, qty)
+            trades_today += 1
             append_log(
                 log_file,
                 "LIVE_SELL_SUBMITTED",
-                symbol=symbol,
+                symbol=sym,
                 side="SELL",
                 order_id=result["orderId"],
                 status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"STOP_LOSS pnl_pct={pnl_pct:.4%} qty={qty:.8f}",
+                details=f"MAX_DRAWDOWN hit dd={dd:.4%} qty={qty:.8f}",
             )
-            print_status("SELL_SUBMITTED", f"STOP_LOSS order_id={result['orderId']} qty={qty:.8f} pnl={pnl_pct:.2%}")
-            return
+            print_status("SELL_SUBMITTED", f"{sym} MAX_DRAWDOWN qty={qty:.8f} dd={dd:.2%}")
+            sstate["halt_until_day_key_et"] = today_key_et()
+            continue
 
-        append_log(log_file, "HOLD", symbol=symbol, details="No exit signal.")
-        print_status("HOLD", "no exit signal")
-        return
+        # TP/SL using Public unrealized pnl%
+        if pnl_pct is not None:
+            if pnl_pct >= take_profit_pct:
+                result = client.place_market_sell_quantity(sym, qty)
+                trades_today += 1
+                append_log(
+                    log_file,
+                    "LIVE_SELL_SUBMITTED",
+                    symbol=sym,
+                    side="SELL",
+                    order_id=result["orderId"],
+                    status="SUBMITTED" if not client.dry_run else "DRY_RUN",
+                    details=f"TAKE_PROFIT pnl_pct={pnl_pct:.4%} qty={qty:.8f}",
+                )
+                print_status("SELL_SUBMITTED", f"{sym} TAKE_PROFIT qty={qty:.8f} pnl={pnl_pct:.2%}")
+                sstate["halt_until_day_key_et"] = today_key_et()
+                continue
 
-    # If flat: buy if buying power allows
-    if buying_power < 1.0:
-        append_log(log_file, "SKIP", details=f"No buying power (buying_power={buying_power:.2f}).")
-        print_status("SKIP", f"no buying power ({buying_power:.2f})")
-        return
+            if pnl_pct <= -stop_loss_pct:
+                result = client.place_market_sell_quantity(sym, qty)
+                trades_today += 1
+                append_log(
+                    log_file,
+                    "LIVE_SELL_SUBMITTED",
+                    symbol=sym,
+                    side="SELL",
+                    order_id=result["orderId"],
+                    status="SUBMITTED" if not client.dry_run else "DRY_RUN",
+                    details=f"STOP_LOSS pnl_pct={pnl_pct:.4%} qty={qty:.8f}",
+                )
+                print_status("SELL_SUBMITTED", f"{sym} STOP_LOSS qty={qty:.8f} pnl={pnl_pct:.2%}")
+                sstate["halt_until_day_key_et"] = today_key_et()
+                continue
 
-    amount = min(max_order_amount_usd, buying_power, 10.0)
-    result = client.place_market_buy_amount(symbol, amount)
-    append_log(
-        log_file,
-        "LIVE_BUY_SUBMITTED",
-        symbol=symbol,
-        side="BUY",
-        amount_usd=f"{amount:.2f}",
-        order_id=result["orderId"],
-        status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-        details=f"BUY amount={amount:.2f} ref_ask={ask:.2f}",
-    )
-    print_status("BUY_SUBMITTED", f"order_id={result['orderId']} amount=${amount:.2f}")
+    # 2) Portfolio exposure trim (worst performers first) if above cap_total
+    # Only trim positions we currently hold in allowlist.
+    if trades_today < max_trades_per_day and cap_total >= 0 and total_equity > 0 and total_exposure > cap_total and snapshots:
+        target_total_pos_value = cap_total * total_equity
+        excess_value = max(0.0, total_pos_value - target_total_pos_value)
+
+        if excess_value > 1.0:
+            # worst pnl first; None pnl treated as 0 (neutral)
+            def pnl_key(snap: Dict[str, Any]) -> float:
+                p = snap.get("pnl_pct")
+                return float(p) if p is not None else 0.0
+
+            snaps_sorted = sorted(snapshots, key=pnl_key)  # worst -> best
+
+            append_log(
+                log_file,
+                "TRIM_PLAN",
+                details=f"excess_value={excess_value:.2f} cap_total={cap_total:.2%} exposure={total_exposure:.2%}",
+            )
+            print_status("TRIM_PLAN", f"excess=${excess_value:.2f} cap_total={cap_total:.2%}")
+
+            # We need prices to convert dollars -> shares reliably.
+            # We'll use portfolio lastPrice where available; if missing, request quotes.
+            need_quotes = [s for s in snaps_sorted if not s.get("last")]
+            if need_quotes:
+                inst = [{"symbol": s["symbol"], "type": "EQUITY"} for s in need_quotes]
+                quotes = client.get_quotes(inst)
+                qmap = {}
+                for q in (quotes.get("quotes") or []):
+                    try:
+                        qmap[q["symbol"].upper()] = float(q["last"])
+                    except Exception:
+                        pass
+                for s in need_quotes:
+                    s["last"] = qmap.get(s["symbol"].upper())
+
+            for snap in snaps_sorted:
+                if trades_today >= max_trades_per_day:
+                    break
+                if excess_value <= 1.0:
+                    break
+
+                sym = snap["symbol"]
+                qty = float(snap["qty"])
+                last = snap.get("last")
+                if not last or last <= 0:
+                    continue
+
+                # sell enough to remove excess_value dollars, capped by full qty
+                sell_qty = min(qty, excess_value / float(last))
+                if sell_qty <= 0:
+                    continue
+
+                result = client.place_market_sell_quantity(sym, sell_qty)
+                trades_today += 1
+                removed = sell_qty * float(last)
+                excess_value = max(0.0, excess_value - removed)
+
+                append_log(
+                    log_file,
+                    "LIVE_SELL_SUBMITTED",
+                    symbol=sym,
+                    side="SELL",
+                    order_id=result["orderId"],
+                    status="SUBMITTED" if not client.dry_run else "DRY_RUN",
+                    details=f"TRIM worst-first sell_qty={sell_qty:.8f} est_removed=${removed:.2f}",
+                )
+                print_status("SELL_SUBMITTED", f"{sym} TRIM sell_qty={sell_qty:.8f} est_removed=${removed:.2f}")
+
+    save_state(state)
 
 
 # -----------------------------
@@ -545,22 +798,34 @@ def main() -> None:
     if mode != "live":
         raise RuntimeError("This file is LIVE-only. Set MODE=live")
 
-    # SAFE env parsing (this fixes your GitHub Actions crash)
+    # Allowlist
+    symbols = parse_symbols_env()
+
+    # Core knobs
     max_trades_per_day = get_env_int("MAX_TRADES_PER_DAY", 1)
-    max_order_amount_usd = get_env_float("MAX_ORDER_AMOUNT_USD", 10.0)
     token_validity_minutes = get_env_int("TOKEN_VALIDITY_MINUTES", 15)
 
-    take_profit_pct = get_env_float("TAKE_PROFIT_PCT", 0.01)  # +1.0%
-    stop_loss_pct = get_env_float("STOP_LOSS_PCT", 0.007)     # -0.7%
+    take_profit_pct = get_env_float("TAKE_PROFIT_PCT", 0.01)
+    stop_loss_pct = get_env_float("STOP_LOSS_PCT", 0.007)
 
-    poll_seconds = get_env_int("POLL_SECONDS", 900)           # 15 min default
+    poll_seconds = get_env_int("POLL_SECONDS", 900)
     run_once = get_env_bool("RUN_ONCE", False)
-
-    # NEW: safety switch
     dry_run = get_env_bool("DRY_RUN", False)
 
+    # Withdrawal + exposure caps (portfolio-level)
+    withdraw_date = parse_withdraw_date_env()
+    lockdown_days = get_env_int("LOCKDOWN_DAYS", 14)
+
+    max_exposure_early = get_env_float("MAX_EXPOSURE_EARLY", 0.30)
+    max_exposure_mid = get_env_float("MAX_EXPOSURE_MID", 0.20)
+    max_exposure_late = get_env_float("MAX_EXPOSURE_LATE", 0.10)
+
+    # Per-symbol kill switch thresholds (position-value based)
+    max_drawdown = get_env_float("MAX_DRAWDOWN", 0.015)         # 1.5%
+    daily_loss_limit = get_env_float("DAILY_LOSS_LIMIT", 0.005) # 0.5%
+
     secret = os.getenv("PUBLIC_SECRET")
-    if not secret or secret.strip() == "":
+    if not secret or not secret.strip():
         raise RuntimeError("Missing PUBLIC_SECRET")
 
     ensure_dir("logs")
@@ -570,49 +835,53 @@ def main() -> None:
         log_file,
         "BOT_START",
         details=(
-            f"live loop | TP={take_profit_pct:.4f} SL={stop_loss_pct:.4f} "
-            f"max_trades_day={max_trades_per_day} max_order={max_order_amount_usd} "
-            f"poll={poll_seconds}s run_once={run_once} dry_run={dry_run}"
+            f"symbols={symbols} TP={take_profit_pct:.4f} SL={stop_loss_pct:.4f} "
+            f"max_trades_day={max_trades_per_day} poll={poll_seconds}s run_once={run_once} dry_run={dry_run} "
+            f"withdraw_date={withdraw_date} lockdown_days={lockdown_days} "
+            f"cap(early/mid/late)={max_exposure_early}/{max_exposure_mid}/{max_exposure_late} "
+            f"max_dd={max_drawdown} daily_loss={daily_loss_limit}"
         ),
     )
     print_status(
         "BOT_START",
-        f"TP={take_profit_pct:.2%} SL={stop_loss_pct:.2%} "
-        f"max_trades_day={max_trades_per_day} max_order=${max_order_amount_usd:.2f} "
-        f"poll={poll_seconds}s run_once={run_once} dry_run={dry_run}",
+        f"symbols={symbols} TP={take_profit_pct:.2%} SL={stop_loss_pct:.2%} "
+        f"withdraw_date={withdraw_date} lockdown_days={lockdown_days} dry_run={dry_run}",
     )
 
     auth = PublicAuth(secret=secret, validity_minutes=token_validity_minutes, log_file=log_file)
     client = PublicClient(auth=auth, log_file=log_file, dry_run=dry_run)
-
     _ = client.get_account_id()
 
     while True:
         try:
-            if os.path.exists("STOP.txt"):
-                append_log(log_file, "STOPPED", details="STOP.txt detected; stopping main loop.")
-                print_status("STOPPED", "STOP.txt detected; exiting")
+            if os.path.exists(STOP_FILE):
+                append_log(log_file, "STOPPED", details=f"{STOP_FILE} detected; stopping main loop.")
+                print_status("STOPPED", f"{STOP_FILE} detected; exiting")
                 return
 
             if not is_market_hours_now():
                 wait = max(60, seconds_until_next_open())
                 append_log(log_file, "SLEEP", details=f"Outside market hours. Sleeping {wait}s.")
                 print_status("SLEEP", f"outside market hours; next open in {wait // 60} min")
-
-                # In GitHub Actions (RUN_ONCE=1), exit immediately outside market hours
                 if run_once:
                     return
-
                 time.sleep(wait)
                 continue
 
             run_live_cycle(
                 client,
                 log_file=log_file,
+                symbols=symbols,
                 max_trades_per_day=max_trades_per_day,
-                max_order_amount_usd=max_order_amount_usd,
                 take_profit_pct=take_profit_pct,
                 stop_loss_pct=stop_loss_pct,
+                withdraw_date=withdraw_date,
+                lockdown_days=lockdown_days,
+                max_exposure_early=max_exposure_early,
+                max_exposure_mid=max_exposure_mid,
+                max_exposure_late=max_exposure_late,
+                max_drawdown=max_drawdown,
+                daily_loss_limit=daily_loss_limit,
             )
 
         except Exception as e:
