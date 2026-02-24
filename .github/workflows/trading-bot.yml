@@ -33,17 +33,34 @@ jobs:
 
           # REQUIRED
           PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+
 
           # Growth config (hardcoded here instead of secrets)
           MAX_TRADES_PER_DAY: "3"
           MAX_ORDER_AMOUNT_USD: "10"
-          TAKE_PROFIT_PCT: "0.03"
-          STOP_LOSS_PCT: "0.02"
+          TAKE_PROFIT_BASE: "0.03"
+          STOP_LOSS_BASE: "0.02"
 
           WITHDRAW_DATE: "2026-05-10"
           LOCKDOWN_DAYS: "14"
 
-          SYMBOLS: "ABBV,BX,CMCSA,COP,CVX,DUK,ITOT,IVV,JNJ,KO,LMT,MDT,MO,PEP,PM,PNC,QQQ,SBUX,SCHB,SCHD,SGOV,SO,SPY,TXN,VOO,VTI,VXUS,VZ,WMB,XOM"
+          # Regime filter
+          REGIME_SYMBOL: "SPY"
+          REGIME_FAST: "50"
+          REGIME_SLOW: "200"
+
+          # Volatility filter
+          ATR_PERIOD: "14"
+
+          # Trend strength
+          TREND_FAST: "20"
+          TREND_SLOW: "50"
+
+          # Position scaling
+          BASE_POSITION_SIZE: "1.0"
+          MAX_POSITION_SCALE: "2.0"
+
 
           MAX_EXPOSURE_EARLY: "0.90"
           MAX_EXPOSURE_MID: "0.75"

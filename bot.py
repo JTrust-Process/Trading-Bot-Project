@@ -10,6 +10,9 @@ from typing import Optional, Dict, Any, List, Tuple
 import requests
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
+from market_data import get_daily_bars
+from strategy import calculate_atr, trend_strength
+
 
 # -----------------------------
 # Constants / Config
@@ -384,6 +387,33 @@ class PublicClient:
 # -----------------------------
 # Portfolio helpers
 # -----------------------------
+
+def get_market_regime():
+    """
+    Returns: "bull", "bear", or None if data unavailable
+    """
+    try:
+        regime_symbol = os.getenv("REGIME_SYMBOL", "SPY")
+        fast = int(os.getenv("REGIME_FAST", "50"))
+        slow = int(os.getenv("REGIME_SLOW", "200"))
+
+        df = get_daily_bars(regime_symbol, max(fast, slow) + 5)
+        if df is None or len(df) < slow:
+            print_status("REGIME", "insufficient data")
+            return None
+
+        ma_fast = df["close"].rolling(fast).mean().iloc[-1]
+        ma_slow = df["close"].rolling(slow).mean().iloc[-1]
+
+        if ma_fast > ma_slow:
+            return "bull"
+        else:
+            return "bear"
+
+    except Exception as e:
+        print_status("REGIME_ERROR", str(e))
+        return None
+
 def find_equity_position(portfolio: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
     for p in (portfolio.get("positions") or []):
         inst = p.get("instrument") or {}
@@ -499,8 +529,10 @@ def run_live_cycle(
     log_file: str,
     symbols: List[str],
     max_trades_per_day: int,
-    take_profit_pct: float,
-    stop_loss_pct: float,
+    atr_vol_threshold: float,
+    take_profit_base: float,
+    stop_loss_base: float,
+    trend_strong_threshold: float,
     withdraw_date: Optional[date],
     lockdown_days: int,
     max_exposure_early: float,
@@ -509,6 +541,10 @@ def run_live_cycle(
     max_drawdown: float,
     daily_loss_limit: float,
 ) -> None:
+    
+    regime = get_market_regime()
+    print_status("MARKET_REGIME", regime)
+
     if os.path.exists(STOP_FILE):
         append_log(log_file, "STOPPED", details=f"{STOP_FILE} detected; skipping cycle.")
         print_status("STOPPED", f"{STOP_FILE} detected; skipping cycle")
@@ -684,7 +720,41 @@ def run_live_cycle(
 
         # TP/SL using Public unrealized pnl%
         if pnl_pct is not None:
-            if pnl_pct >= take_profit_pct:
+            df = get_daily_bars(sym)
+            if df is None or len(df) < 30:
+                continue
+
+            atr = calculate_atr(df)
+            price = get_last_price(pos)
+
+            if not price or price <= 0:
+                continue
+
+            # Volatility filter
+            if atr / price < atr_vol_threshold:
+                append_log(log_file, "SKIP", symbol=sym, details="ATR below volatility threshold")
+                continue
+
+            strength = trend_strength(df)
+
+            # Dynamic TP scaling
+            scale = 1 + (strength / trend_strong_threshold)
+            scale = min(scale, 2.0)
+
+            dynamic_tp = take_profit_base * scale
+            dynamic_sl = stop_loss_base
+            
+            if regime == "bear":
+                dynamic_sl = stop_loss_base * 0.7
+
+            append_log(
+                log_file,
+                "DYNAMIC_LEVELS",
+                symbol=sym,
+                details=f"tp={dynamic_tp:.4%} sl={dynamic_sl:.4%} strength={strength:.4f}"
+            )
+
+            if pnl_pct >= dynamic_tp:
                 result = client.place_market_sell_quantity(sym, qty)
                 trades_today += 1
                 append_log(
@@ -694,13 +764,13 @@ def run_live_cycle(
                     side="SELL",
                     order_id=result["orderId"],
                     status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                    details=f"TAKE_PROFIT pnl_pct={pnl_pct:.4%} qty={qty:.8f}",
+                    details=f"DYNAMIC_TP pnl_pct={pnl_pct:.4%}",
                 )
-                print_status("SELL_SUBMITTED", f"{sym} TAKE_PROFIT qty={qty:.8f} pnl={pnl_pct:.2%}")
+                print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_TP {pnl_pct:.2%}")
                 sstate["halt_until_day_key_et"] = today_key_et()
                 continue
 
-            if pnl_pct <= -stop_loss_pct:
+            if pnl_pct <= -dynamic_sl:
                 result = client.place_market_sell_quantity(sym, qty)
                 trades_today += 1
                 append_log(
@@ -710,9 +780,9 @@ def run_live_cycle(
                     side="SELL",
                     order_id=result["orderId"],
                     status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                    details=f"STOP_LOSS pnl_pct={pnl_pct:.4%} qty={qty:.8f}",
+                    details=f"DYNAMIC_SL pnl_pct={pnl_pct:.4%}",
                 )
-                print_status("SELL_SUBMITTED", f"{sym} STOP_LOSS qty={qty:.8f} pnl={pnl_pct:.2%}")
+                print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_SL {pnl_pct:.2%}")
                 sstate["halt_until_day_key_et"] = today_key_et()
                 continue
 
@@ -800,13 +870,22 @@ def main() -> None:
 
     # Allowlist
     symbols = parse_symbols_env()
+    atr_period = get_env_int("ATR_PERIOD", 14)
+    atr_vol_threshold = get_env_float("ATR_VOL_THRESHOLD", 0.01)
+
+    trend_fast = get_env_int("TREND_FAST", 5)
+    trend_slow = get_env_int("TREND_SLOW", 20)
+    trend_strong_threshold = get_env_float("TREND_STRONG_THRESHOLD", 0.02)
+
+    take_profit_base = get_env_float("TAKE_PROFIT_BASE", 0.04)
+    stop_loss_base = get_env_float("STOP_LOSS_BASE", 0.02)
+
 
     # Core knobs
     max_trades_per_day = get_env_int("MAX_TRADES_PER_DAY", 1)
     token_validity_minutes = get_env_int("TOKEN_VALIDITY_MINUTES", 15)
 
-    take_profit_pct = get_env_float("TAKE_PROFIT_PCT", 0.01)
-    stop_loss_pct = get_env_float("STOP_LOSS_PCT", 0.007)
+    
 
     poll_seconds = get_env_int("POLL_SECONDS", 900)
     run_once = get_env_bool("RUN_ONCE", False)
@@ -835,7 +914,7 @@ def main() -> None:
         log_file,
         "BOT_START",
         details=(
-            f"symbols={symbols} TP={take_profit_pct:.4f} SL={stop_loss_pct:.4f} "
+            f"symbols={symbols} TP_BASE={take_profit_base:.4f} SL_BASE={stop_loss_base:.4f} "
             f"max_trades_day={max_trades_per_day} poll={poll_seconds}s run_once={run_once} dry_run={dry_run} "
             f"withdraw_date={withdraw_date} lockdown_days={lockdown_days} "
             f"cap(early/mid/late)={max_exposure_early}/{max_exposure_mid}/{max_exposure_late} "
@@ -844,7 +923,7 @@ def main() -> None:
     )
     print_status(
         "BOT_START",
-        f"symbols={symbols} TP={take_profit_pct:.2%} SL={stop_loss_pct:.2%} "
+        f"symbols={symbols} TP_BASE={take_profit_base:.2%} SL_BASE={stop_loss_base:.2%} "
         f"withdraw_date={withdraw_date} lockdown_days={lockdown_days} dry_run={dry_run}",
     )
 
@@ -873,8 +952,10 @@ def main() -> None:
                 log_file=log_file,
                 symbols=symbols,
                 max_trades_per_day=max_trades_per_day,
-                take_profit_pct=take_profit_pct,
-                stop_loss_pct=stop_loss_pct,
+                atr_vol_threshold=atr_vol_threshold,
+                take_profit_base=take_profit_base,
+                stop_loss_base=stop_loss_base,
+                trend_strong_threshold=trend_strong_threshold,
                 withdraw_date=withdraw_date,
                 lockdown_days=lockdown_days,
                 max_exposure_early=max_exposure_early,
