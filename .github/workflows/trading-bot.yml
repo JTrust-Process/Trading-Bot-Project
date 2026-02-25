@@ -35,6 +35,7 @@ jobs:
           PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
 
+          SYMBOLS: "CMCSA,COP,CVX,DUK,ITOT,IVV,KO,MDT,MO,PEP,PM,QQQ,SCHB,SCHD,SGOV,SPY,VOO,VTI,VXUS,VZ"
 
           # Growth config (hardcoded here instead of secrets)
           MAX_TRADES_PER_DAY: "3"
