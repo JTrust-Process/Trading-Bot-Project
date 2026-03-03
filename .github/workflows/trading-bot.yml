@@ -30,50 +30,62 @@ jobs:
         env:
           MODE: "live"
           RUN_ONCE: "1"
+          TZ: "America/New_York"
 
-          # REQUIRED
+          # --- Secrets (set in GitHub repo Settings → Secrets → Actions) ---
           PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
+          # --- Symbols ---
           SYMBOLS: "CMCSA,COP,CVX,DUK,ITOT,IVV,KO,MDT,MO,PEP,PM,QQQ,SCHB,SCHD,SGOV,SPY,VOO,VTI,VXUS,VZ"
+          SCAN_SYMBOLS: "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA"
+          MANAGE_ALL_POSITIONS: "true"
 
-          # Growth config (hardcoded here instead of secrets)
-          MAX_TRADES_PER_DAY: "3"
+          # --- Trade limits ---
+          MAX_TRADES_PER_DAY: "10"
           MAX_ORDER_AMOUNT_USD: "10"
-          TAKE_PROFIT_BASE: "0.03"
+          MAX_OPEN_POSITIONS: "5"
+
+          # --- TP / SL ---
+          TAKE_PROFIT_BASE: "0.04"
           STOP_LOSS_BASE: "0.02"
 
+          # --- Withdrawal glide path ---
           WITHDRAW_DATE: "2026-05-10"
           LOCKDOWN_DAYS: "14"
 
-          # Regime filter
-          REGIME_SYMBOL: "SPY"
-          REGIME_FAST: "50"
-          REGIME_SLOW: "200"
-
-          # Volatility filter
-          ATR_PERIOD: "14"
-
-          # Trend strength
-          TREND_FAST: "20"
-          TREND_SLOW: "50"
-
-          # Position scaling
-          BASE_POSITION_SIZE: "1.0"
-          MAX_POSITION_SCALE: "2.0"
-
-
+          # --- Exposure caps ---
           MAX_EXPOSURE_EARLY: "0.90"
           MAX_EXPOSURE_MID: "0.75"
           MAX_EXPOSURE_LATE: "0.50"
 
+          # --- Kill switches ---
           MAX_DRAWDOWN: "0.08"
           DAILY_LOSS_LIMIT: "0.03"
+          LOSS_COOLDOWN_DAYS: "3"
 
-          TZ: "America/New_York"
+          # --- Regime filter ---
+          REGIME_SYMBOL: "SPY"
+          REGIME_FAST: "50"
+          REGIME_SLOW: "200"
+
+          # --- Volatility filter ---
+          ATR_PERIOD: "14"
+          ATR_VOL_THRESHOLD: "0.01"
+
+          # --- Trend strength ---
+          TREND_FAST: "5"
+          TREND_SLOW: "20"
+          TREND_STRONG_THRESHOLD: "0.5"
+
+          # --- Position sizing ---
+          BASE_POSITION_SIZE: "0.10"
+          MAX_POSITION_SCALE: "2.0"
+
         run: |
           python bot.py
-
 
       - name: Upload logs
         if: always()

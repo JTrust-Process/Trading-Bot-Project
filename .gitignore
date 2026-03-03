@@ -1,12 +1,11 @@
 .env
-trade_log.csv
 venv/
 __pycache__/
 *.pyc
 logs/
 state.json
 equity.csv
-trades.csv
-holdings.csv
-weights.csv
-strategy_return.csv
+ trades.csv
+ holdings.csv
+ weights.csv
+ strategy_return.csv
