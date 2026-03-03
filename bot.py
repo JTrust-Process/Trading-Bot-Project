@@ -11,7 +11,7 @@ import requests
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from market_data import get_daily_bars
-from strategy import calculate_atr, trend_strength
+from strategy import calculate_atr, trend_strength, generate_signal
 
 
 # -----------------------------
@@ -540,31 +540,28 @@ def run_live_cycle(
     max_exposure_late: float,
     max_drawdown: float,
     daily_loss_limit: float,
+    atr_period: int,
+    trend_fast: int,
+    trend_slow: int,
 ) -> None:
-    
+
     regime = get_market_regime()
     print_status("MARKET_REGIME", regime)
 
     if os.path.exists(STOP_FILE):
-        append_log(log_file, "STOPPED", details=f"{STOP_FILE} detected; skipping cycle.")
-        print_status("STOPPED", f"{STOP_FILE} detected; skipping cycle")
+        append_log(log_file, "STOPPED", details="STOP file detected")
         return
 
-    # Trade limit (global)
     trades_today = count_trades_today(log_file)
     if trades_today >= max_trades_per_day:
-        append_log(log_file, "SKIP", details="Trade limit reached for today.")
-        print_status("SKIP", f"trade limit reached (trades_today={trades_today}, limit={max_trades_per_day})")
         return
 
     state = load_state()
 
-    # Portfolio snapshot
     portfolio = client.get_portfolio_v2()
     total_equity = get_total_equity_usd(portfolio)
     buying_power = get_buying_power_usd(portfolio)
 
-    # Glide-path cap is portfolio-level
     days_left = days_until_withdraw(withdraw_date)
     cap_total = compute_max_exposure(
         days_left,
@@ -574,14 +571,12 @@ def run_live_cycle(
         lockdown_days=lockdown_days,
     )
 
-    # Build current symbol snapshots
-    snapshots: List[Dict[str, Any]] = []
+    snapshots = []
     total_pos_value = 0.0
 
     for sym in symbols:
         pos = find_equity_position(portfolio, sym)
         if not pos:
-            # if you don't hold it, we do nothing (you said: no buys for non-owned)
             continue
 
         qty = get_position_qty(pos)
@@ -597,96 +592,122 @@ def run_live_cycle(
             "pos": pos,
             "qty": float(qty),
             "value": float(pos_value),
-            "pnl_pct": pnl_pct,   # may be None
-            "last": last_px,      # may be None
+            "pnl_pct": pnl_pct,
+            "last": last_px,
         })
+
         total_pos_value += float(pos_value)
 
-    total_exposure = (total_pos_value / total_equity) if total_equity > 0 else 0.0
-
-    append_log(
-        log_file,
-        "PORTFOLIO",
-        details=f"equity={total_equity:.2f} pos_value={total_pos_value:.2f} exposure={total_exposure:.2%} "
-                f"bp={buying_power:.2f} days_left={days_left} cap_total={cap_total:.2%}",
-    )
-    print_status(
-        "PORTFOLIO",
-        f"equity={total_equity:.2f} exposure={total_exposure:.2%} cap_total={cap_total:.2%} days_left={days_left}",
+    total_exposure = (
+        total_pos_value / total_equity if total_equity > 0 else 0
     )
 
-    # Hard lockdown: sell everything we manage
-    in_lockdown = (days_left is not None and days_left <= lockdown_days)
-    if in_lockdown and snapshots:
-        for snap in snapshots:
+    # ==========================================================
+    # ENTRY LOGIC (FIXED)
+    # ==========================================================
+    if (
+        trades_today < max_trades_per_day
+        and regime == "bull"
+        and total_exposure < cap_total
+        and buying_power > 50
+    ):
+
+        for sym in symbols:
             if trades_today >= max_trades_per_day:
                 break
-            sym = snap["symbol"]
-            qty = snap["qty"]
-            result = client.place_market_sell_quantity(sym, qty)
+
+            if find_equity_position(portfolio, sym):
+                continue
+
+            df = get_daily_bars(sym)
+            if df is None or len(df) < trend_slow + 5:
+                continue
+
+            signal = generate_signal(df)
+            if signal != "BUY":
+                continue
+
+            atr = calculate_atr(df, atr_period)
+            price = float(df["close"].iloc[-1])
+
+            if price <= 0 or atr is None:
+                continue
+
+            if atr / price < atr_vol_threshold:
+                continue
+
+            strength = trend_strength(df, trend_fast, trend_slow)
+            if strength < trend_strong_threshold:
+                continue
+
+            remaining_exposure = cap_total - total_exposure
+            if remaining_exposure <= 0:
+                break
+
+            alloc_value = min(
+                total_equity * 0.10,
+                total_equity * remaining_exposure,
+                buying_power * 0.95,
+            )
+
+            if alloc_value < 50:
+                continue
+
+            qty = alloc_value / price
+            if qty <= 0:
+                continue
+
+            result = client.place_market_buy_quantity(sym, qty)
             trades_today += 1
+
+            total_pos_value += alloc_value
+            total_exposure = total_pos_value / total_equity
+
             append_log(
                 log_file,
-                "LIVE_SELL_SUBMITTED",
+                "LIVE_BUY_SUBMITTED",
                 symbol=sym,
-                side="SELL",
+                side="BUY",
                 order_id=result["orderId"],
-                status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"LOCKDOWN days_left={days_left} qty={qty:.8f}",
+                details=f"signal=BUY strength={strength:.4f} alloc={alloc_value:.2f}",
             )
-            print_status("SELL_SUBMITTED", f"{sym} LOCKDOWN qty={qty:.8f}")
-        save_state(state)
-        return
 
-    # 1) Per-symbol TP/SL + per-symbol kill-switches (independent)
+    # ==========================================================
+    # EXIT LOGIC (IMPROVED DYNAMIC TP)
+    # ==========================================================
     for snap in snapshots:
+
         if trades_today >= max_trades_per_day:
             break
 
         sym = snap["symbol"]
         qty = snap["qty"]
-        pos_value = snap["value"]
         pnl_pct = snap["pnl_pct"]
 
-        sstate = sym_state(state, sym)
-
-        # initialize / roll day
-        dkey = today_key_et()
-        if sstate.get("day_key_et") != dkey:
-            sstate["day_key_et"] = dkey
-            sstate["day_start_value"] = float(pos_value)
-            # peak_value is persistent per symbol (do not reset daily)
-            if float(sstate.get("peak_value") or 0.0) <= 0:
-                sstate["peak_value"] = float(pos_value)
-            # clear halt if it was for previous day
-            if (sstate.get("halt_until_day_key_et") or "") < dkey:
-                sstate["halt_until_day_key_et"] = ""
-
-        # halt check (per symbol)
-        if should_halt_symbol(sstate):
-            append_log(log_file, "SKIP", symbol=sym, details=f"HALTED (until_day_key={sstate.get('halt_until_day_key_et')})")
-            print_status("SKIP", f"{sym} halted until {sstate.get('halt_until_day_key_et')}")
+        if pnl_pct is None:
             continue
 
-        # update peak/drawdown based on position value
-        peak = float(sstate.get("peak_value") or 0.0)
-        peak = max(peak, float(pos_value))
-        sstate["peak_value"] = peak
+        df = get_daily_bars(sym)
+        if df is None or len(df) < trend_slow + 5:
+            continue
 
-        dd = (1.0 - float(pos_value) / peak) if peak > 0 else 0.0
-        start_val = float(sstate.get("day_start_value") or float(pos_value) or 0.0)
-        daily_ret = (float(pos_value) / start_val - 1.0) if start_val > 0 else 0.0
+        atr = calculate_atr(df, atr_period)
+        price = float(df["close"].iloc[-1])
 
-        append_log(
-            log_file,
-            "SYMBOL_STATE",
-            symbol=sym,
-            details=f"value={pos_value:.2f} pnl_pct={(pnl_pct if pnl_pct is not None else float('nan'))} "
-                    f"daily_ret={daily_ret:.2%} dd={dd:.2%} peak={peak:.2f} start={start_val:.2f}",
-        )
+        if not price or atr / price < atr_vol_threshold:
+            continue
 
-        # Per-symbol kill switches: sell + halt rest of day
-        if daily_loss_limit > 0 and daily_ret <= -daily_loss_limit:
+        strength = trend_strength(df, trend_fast, trend_slow)
+
+        # More stable scaling
+        strength_ratio = min(strength / trend_strong_threshold, 1.5)
+        dynamic_tp = take_profit_base * (1 + 0.5 * strength_ratio)
+
+        dynamic_sl = stop_loss_base
+        if regime == "bear":
+            dynamic_sl *= 0.8
+
+        if pnl_pct >= dynamic_tp:
             result = client.place_market_sell_quantity(sym, qty)
             trades_today += 1
             append_log(
@@ -695,14 +716,10 @@ def run_live_cycle(
                 symbol=sym,
                 side="SELL",
                 order_id=result["orderId"],
-                status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"DAILY_LOSS_LIMIT hit daily_ret={daily_ret:.4%} qty={qty:.8f}",
+                details=f"DYNAMIC_TP pnl={pnl_pct:.2%}",
             )
-            print_status("SELL_SUBMITTED", f"{sym} DAILY_LOSS_LIMIT qty={qty:.8f} daily={daily_ret:.2%}")
-            sstate["halt_until_day_key_et"] = today_key_et()
-            continue
 
-        if max_drawdown > 0 and dd >= max_drawdown:
+        elif pnl_pct <= -dynamic_sl:
             result = client.place_market_sell_quantity(sym, qty)
             trades_today += 1
             append_log(
@@ -711,152 +728,10 @@ def run_live_cycle(
                 symbol=sym,
                 side="SELL",
                 order_id=result["orderId"],
-                status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"MAX_DRAWDOWN hit dd={dd:.4%} qty={qty:.8f}",
+                details=f"DYNAMIC_SL pnl={pnl_pct:.2%}",
             )
-            print_status("SELL_SUBMITTED", f"{sym} MAX_DRAWDOWN qty={qty:.8f} dd={dd:.2%}")
-            sstate["halt_until_day_key_et"] = today_key_et()
-            continue
-
-        # TP/SL using Public unrealized pnl%
-        if pnl_pct is not None:
-            df = get_daily_bars(sym)
-            if df is None or len(df) < 30:
-                continue
-
-            atr = calculate_atr(df)
-            price = get_last_price(pos)
-
-            if not price or price <= 0:
-                continue
-
-            # Volatility filter
-            if atr / price < atr_vol_threshold:
-                append_log(log_file, "SKIP", symbol=sym, details="ATR below volatility threshold")
-                continue
-
-            strength = trend_strength(df)
-
-            # Dynamic TP scaling
-            scale = 1 + (strength / trend_strong_threshold)
-            scale = min(scale, 2.0)
-
-            dynamic_tp = take_profit_base * scale
-            dynamic_sl = stop_loss_base
-            
-            if regime == "bear":
-                dynamic_sl = stop_loss_base * 0.7
-
-            append_log(
-                log_file,
-                "DYNAMIC_LEVELS",
-                symbol=sym,
-                details=f"tp={dynamic_tp:.4%} sl={dynamic_sl:.4%} strength={strength:.4f}"
-            )
-
-            if pnl_pct >= dynamic_tp:
-                result = client.place_market_sell_quantity(sym, qty)
-                trades_today += 1
-                append_log(
-                    log_file,
-                    "LIVE_SELL_SUBMITTED",
-                    symbol=sym,
-                    side="SELL",
-                    order_id=result["orderId"],
-                    status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                    details=f"DYNAMIC_TP pnl_pct={pnl_pct:.4%}",
-                )
-                print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_TP {pnl_pct:.2%}")
-                sstate["halt_until_day_key_et"] = today_key_et()
-                continue
-
-            if pnl_pct <= -dynamic_sl:
-                result = client.place_market_sell_quantity(sym, qty)
-                trades_today += 1
-                append_log(
-                    log_file,
-                    "LIVE_SELL_SUBMITTED",
-                    symbol=sym,
-                    side="SELL",
-                    order_id=result["orderId"],
-                    status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                    details=f"DYNAMIC_SL pnl_pct={pnl_pct:.4%}",
-                )
-                print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_SL {pnl_pct:.2%}")
-                sstate["halt_until_day_key_et"] = today_key_et()
-                continue
-
-    # 2) Portfolio exposure trim (worst performers first) if above cap_total
-    # Only trim positions we currently hold in allowlist.
-    if trades_today < max_trades_per_day and cap_total >= 0 and total_equity > 0 and total_exposure > cap_total and snapshots:
-        target_total_pos_value = cap_total * total_equity
-        excess_value = max(0.0, total_pos_value - target_total_pos_value)
-
-        if excess_value > 1.0:
-            # worst pnl first; None pnl treated as 0 (neutral)
-            def pnl_key(snap: Dict[str, Any]) -> float:
-                p = snap.get("pnl_pct")
-                return float(p) if p is not None else 0.0
-
-            snaps_sorted = sorted(snapshots, key=pnl_key)  # worst -> best
-
-            append_log(
-                log_file,
-                "TRIM_PLAN",
-                details=f"excess_value={excess_value:.2f} cap_total={cap_total:.2%} exposure={total_exposure:.2%}",
-            )
-            print_status("TRIM_PLAN", f"excess=${excess_value:.2f} cap_total={cap_total:.2%}")
-
-            # We need prices to convert dollars -> shares reliably.
-            # We'll use portfolio lastPrice where available; if missing, request quotes.
-            need_quotes = [s for s in snaps_sorted if not s.get("last")]
-            if need_quotes:
-                inst = [{"symbol": s["symbol"], "type": "EQUITY"} for s in need_quotes]
-                quotes = client.get_quotes(inst)
-                qmap = {}
-                for q in (quotes.get("quotes") or []):
-                    try:
-                        qmap[q["symbol"].upper()] = float(q["last"])
-                    except Exception:
-                        pass
-                for s in need_quotes:
-                    s["last"] = qmap.get(s["symbol"].upper())
-
-            for snap in snaps_sorted:
-                if trades_today >= max_trades_per_day:
-                    break
-                if excess_value <= 1.0:
-                    break
-
-                sym = snap["symbol"]
-                qty = float(snap["qty"])
-                last = snap.get("last")
-                if not last or last <= 0:
-                    continue
-
-                # sell enough to remove excess_value dollars, capped by full qty
-                sell_qty = min(qty, excess_value / float(last))
-                if sell_qty <= 0:
-                    continue
-
-                result = client.place_market_sell_quantity(sym, sell_qty)
-                trades_today += 1
-                removed = sell_qty * float(last)
-                excess_value = max(0.0, excess_value - removed)
-
-                append_log(
-                    log_file,
-                    "LIVE_SELL_SUBMITTED",
-                    symbol=sym,
-                    side="SELL",
-                    order_id=result["orderId"],
-                    status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                    details=f"TRIM worst-first sell_qty={sell_qty:.8f} est_removed=${removed:.2f}",
-                )
-                print_status("SELL_SUBMITTED", f"{sym} TRIM sell_qty={sell_qty:.8f} est_removed=${removed:.2f}")
 
     save_state(state)
-
 
 # -----------------------------
 # Main
@@ -875,7 +750,7 @@ def main() -> None:
 
     trend_fast = get_env_int("TREND_FAST", 5)
     trend_slow = get_env_int("TREND_SLOW", 20)
-    trend_strong_threshold = get_env_float("TREND_STRONG_THRESHOLD", 0.02)
+    trend_strong_threshold = get_env_float("TREND_STRONG_THRESHOLD", 0.5)
 
     take_profit_base = get_env_float("TAKE_PROFIT_BASE", 0.04)
     stop_loss_base = get_env_float("STOP_LOSS_BASE", 0.02)
@@ -963,6 +838,9 @@ def main() -> None:
                 max_exposure_late=max_exposure_late,
                 max_drawdown=max_drawdown,
                 daily_loss_limit=daily_loss_limit,
+                atr_period=atr_period,
+                trend_fast=trend_fast,
+                trend_slow=trend_slow,
             )
 
         except Exception as e:
