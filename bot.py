@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from market_data import get_daily_bars
 from strategy import calculate_atr, trend_strength, generate_signal
 from supabase import create_client
+from monitor import monitor
 
 
 # -----------------------------
@@ -627,6 +628,7 @@ def run_live_cycle(
 
     regime = get_market_regime()
     print_status("MARKET_REGIME", str(regime))
+    monitor.log_event("MARKET_REGIME", metadata={"regime": str(regime)})
 
     if os.path.exists(STOP_FILE):
         append_log(log_file, "STOPPED", details="STOP file detected")
@@ -714,6 +716,8 @@ def run_live_cycle(
             qty = snap["qty"]
             result = client.place_market_sell_quantity(sym, qty)
             trades_today += 1
+            monitor.trade_count += 1
+            monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "SELL", "strategy": "lockdown"})
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=snap["avg_cost"], exit_price=snap["last"],
@@ -785,6 +789,8 @@ def run_live_cycle(
         if daily_loss_limit > 0 and daily_ret <= -daily_loss_limit:
             result = client.place_market_sell_quantity(sym, qty)
             trades_today += 1
+            monitor.trade_count += 1
+            monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "SELL", "strategy": "daily_loss_limit", "daily_ret": round(daily_ret, 4)})
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=entry_price, exit_price=current_price,
@@ -808,6 +814,8 @@ def run_live_cycle(
         if max_drawdown > 0 and dd >= max_drawdown:
             result = client.place_market_sell_quantity(sym, qty)
             trades_today += 1
+            monitor.trade_count += 1
+            monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "SELL", "strategy": "max_drawdown", "dd": round(dd, 4)})
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=entry_price, exit_price=current_price,
@@ -963,6 +971,8 @@ def run_live_cycle(
             result = client.place_market_buy_quantity(sym, qty)
             trades_today += 1
             open_positions += 1
+            monitor.trade_count += 1
+            monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "BUY", "price": price, "alloc": alloc_value})
             total_pos_value += alloc_value
             total_exposure = total_pos_value / total_equity
 
@@ -1000,6 +1010,8 @@ def main() -> None:
         print_status("SUPABASE_INIT", "client initialized")
     else:
         print_status("SUPABASE_SKIP", "SUPABASE_URL or SUPABASE_SERVICE_KEY not set — trades won't sync")
+
+    monitor.start_run()
 
     mode = get_env_str("MODE", "live").lower()
     if mode != "live":
@@ -1118,6 +1130,7 @@ def main() -> None:
         except Exception as e:
             append_log(log_file, "ERROR", details=str(e))
             print_status("ERROR", str(e))
+            monitor.log_error("run_live_cycle", e, severity="warning")
 
         if run_once:
             return
@@ -1126,4 +1139,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        monitor.end_run(status="success")
+    except Exception as e:
+        monitor.log_error("bot_main", e, severity="critical")
+        monitor.end_run(status="failed")
+        raise
