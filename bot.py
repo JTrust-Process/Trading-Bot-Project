@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from market_data import get_daily_bars
 from strategy import calculate_atr, trend_strength, generate_signal
 from momentum import rank_symbols, get_buy_candidates, should_sell_momentum, MomentumScore
+from breakout import check_breakout, BreakoutResult
 from supabase import create_client
 from monitor import monitor
 
@@ -167,43 +168,9 @@ def append_log(
     details: str = "",
 ) -> None:
     ensure_log_header(log_file)
-    ts = utcnow().isoformat()
     with open(log_file, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow([ts, event, symbol, side, amount_usd, order_id, status, details])
-    # Mirror to Supabase bot_logs table
-    _log_to_supabase(ts, event, symbol=symbol, side=side, amount_usd=amount_usd,
-                     order_id=order_id, status=status, details=details)
-
-
-def _log_to_supabase(
-    ts: str,
-    event: str,
-    *,
-    symbol: str = "",
-    side: str = "",
-    amount_usd: str = "",
-    order_id: str = "",
-    status: str = "",
-    details: str = "",
-) -> None:
-    """Write a log entry to Supabase bot_logs. Never crashes the bot."""
-    global supabase
-    if supabase is None:
-        return
-    try:
-        supabase.table("bot_logs").insert({
-            "timestamp_utc": ts,
-            "event": event,
-            "symbol": symbol or None,
-            "side": side or None,
-            "amount_usd": amount_usd or None,
-            "order_id": order_id or None,
-            "status": status or None,
-            "details": details or None,
-        }).execute()
-    except Exception as e:
-        print_status("SUPABASE_LOG_ERROR", str(e))
+        w.writerow([utcnow().isoformat(), event, symbol, side, amount_usd, order_id, status, details])
 
 
 def print_status(event: str, details: str = "") -> None:
@@ -662,6 +629,10 @@ def run_live_cycle(
     momentum_symbols: List[str],
     momentum_top_n: int = 3,
     momentum_sell_rank: int = 5,
+    breakout_lookback: int = 20,
+    breakout_threshold_bull: float = 0.1,
+    breakout_threshold_bear: float = 0.3,
+    breakout_bear_size_factor: float = 0.5,
 ) -> None:
 
     regime = get_market_regime()
@@ -990,16 +961,42 @@ def run_live_cycle(
                 append_log(log_file, "SKIP", symbol=sym, details="In cooldown, skipping buy")
                 continue
 
-            # Use momentum ranking for buy candidates
+            # ── Signal check: momentum OR breakout ───────────────────
             mom_score = next((ms for ms in momentum_scores if ms.symbol == sym), None)
-            if mom_score is None or not mom_score.valid or mom_score.score <= 0:
-                append_log(log_file, "SKIP", symbol=sym, details="No positive momentum score")
+            mom_score_val = mom_score.score if (mom_score and mom_score.valid) else -999.0
+
+            momentum_signal = (
+                mom_score is not None
+                and mom_score.valid
+                and mom_score.score > 0
+                and mom_score.rank <= momentum_top_n
+            )
+
+            # Only run breakout check if momentum didn't already qualify
+            breakout_result = None
+            breakout_signal = False
+            breakout_size_factor = 1.0
+            if not momentum_signal and sym in momentum_symbols:
+                breakout_result = check_breakout(
+                    sym, regime,
+                    momentum_score=mom_score_val,
+                    lookback=breakout_lookback,
+                )
+                breakout_signal = breakout_result.signal
+                breakout_size_factor = breakout_result.size_factor
+                append_log(log_file, "BREAKOUT_CHECK", symbol=sym,
+                    details=f"signal={breakout_result.signal} reason={breakout_result.reason} "
+                            f"price={breakout_result.price} threshold={breakout_result.threshold} "
+                            f"regime={regime} size_factor={breakout_result.size_factor}")
+
+            if not momentum_signal and not breakout_signal:
+                reason = "no momentum or breakout signal"
+                if mom_score and mom_score.valid:
+                    reason = f"momentum rank={mom_score.rank} score={mom_score.score:.4f}, no breakout"
+                append_log(log_file, "SKIP", symbol=sym, details=reason)
                 continue
 
-            # Only buy top_n momentum leaders
-            if mom_score.rank > momentum_top_n:
-                append_log(log_file, "SKIP", symbol=sym, details=f"Momentum rank {mom_score.rank} outside top {momentum_top_n}")
-                continue
+            signal_type = "momentum" if momentum_signal else "breakout"
 
             df = get_daily_bars(sym)
             if df is None or len(df) < trend_slow + 5:
@@ -1100,6 +1097,12 @@ def main() -> None:
     momentum_top_n = get_env_int("MOMENTUM_TOP_N", 3)
     momentum_sell_rank = get_env_int("MOMENTUM_SELL_RANK", 5)
 
+    # Breakout config
+    breakout_lookback = get_env_int("BREAKOUT_LOOKBACK", 20)
+    breakout_threshold_bull = get_env_float("BREAKOUT_THRESHOLD_BULL", 0.1)
+    breakout_threshold_bear = get_env_float("BREAKOUT_THRESHOLD_BEAR", 0.3)
+    breakout_bear_size_factor = get_env_float("BREAKOUT_BEAR_SIZE_FACTOR", 0.5)
+
     take_profit_base = get_env_float("TAKE_PROFIT_BASE", 0.04)
     stop_loss_base = get_env_float("STOP_LOSS_BASE", 0.02)
 
@@ -1180,6 +1183,10 @@ def main() -> None:
                 momentum_symbols=momentum_symbols,
                 momentum_top_n=momentum_top_n,
                 momentum_sell_rank=momentum_sell_rank,
+                breakout_lookback=breakout_lookback,
+                breakout_threshold_bull=breakout_threshold_bull,
+                breakout_threshold_bear=breakout_threshold_bear,
+                breakout_bear_size_factor=breakout_bear_size_factor,
                 max_trades_per_day=max_trades_per_day,
                 max_order_amount_usd=max_order_amount_usd,
                 max_open_positions=max_open_positions,
