@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from market_data import get_daily_bars
 from strategy import calculate_atr, trend_strength, generate_signal
+from momentum import rank_symbols, get_buy_candidates, should_sell_momentum, MomentumScore
 from supabase import create_client
 from monitor import monitor
 
@@ -166,9 +167,43 @@ def append_log(
     details: str = "",
 ) -> None:
     ensure_log_header(log_file)
+    ts = utcnow().isoformat()
     with open(log_file, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow([utcnow().isoformat(), event, symbol, side, amount_usd, order_id, status, details])
+        w.writerow([ts, event, symbol, side, amount_usd, order_id, status, details])
+    # Mirror to Supabase bot_logs table
+    _log_to_supabase(ts, event, symbol=symbol, side=side, amount_usd=amount_usd,
+                     order_id=order_id, status=status, details=details)
+
+
+def _log_to_supabase(
+    ts: str,
+    event: str,
+    *,
+    symbol: str = "",
+    side: str = "",
+    amount_usd: str = "",
+    order_id: str = "",
+    status: str = "",
+    details: str = "",
+) -> None:
+    """Write a log entry to Supabase bot_logs. Never crashes the bot."""
+    global supabase
+    if supabase is None:
+        return
+    try:
+        supabase.table("bot_logs").insert({
+            "timestamp_utc": ts,
+            "event": event,
+            "symbol": symbol or None,
+            "side": side or None,
+            "amount_usd": amount_usd or None,
+            "order_id": order_id or None,
+            "status": status or None,
+            "details": details or None,
+        }).execute()
+    except Exception as e:
+        print_status("SUPABASE_LOG_ERROR", str(e))
 
 
 def print_status(event: str, details: str = "") -> None:
@@ -624,11 +659,21 @@ def run_live_cycle(
     atr_period: int,
     trend_fast: int,
     trend_slow: int,
+    momentum_symbols: List[str],
+    momentum_top_n: int = 3,
+    momentum_sell_rank: int = 5,
 ) -> None:
 
     regime = get_market_regime()
     print_status("MARKET_REGIME", str(regime))
-    monitor.log_event("MARKET_REGIME", metadata={"regime": str(regime)})
+
+    # ── Momentum ranking (computed once per cycle) ───────────────────────────
+    momentum_scores = rank_symbols(momentum_symbols)
+    for ms in momentum_scores[:10]:
+        if ms.valid:
+            append_log(log_file, "MOMENTUM_SCORE", symbol=ms.symbol,
+                details=f"rank={ms.rank} score={ms.score:.4f} r1d={ms.ret_1d:.4f} r5d={ms.ret_5d:.4f} r10d={ms.ret_10d:.4f}")
+        print_status("MOMENTUM", f"{ms.symbol} rank={ms.rank} score={ms.score:.4f}")
 
     if os.path.exists(STOP_FILE):
         append_log(log_file, "STOPPED", details="STOP file detected")
@@ -716,8 +761,6 @@ def run_live_cycle(
             qty = snap["qty"]
             result = client.place_market_sell_quantity(sym, qty)
             trades_today += 1
-            monitor.trade_count += 1
-            monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "SELL", "strategy": "lockdown"})
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=snap["avg_cost"], exit_price=snap["last"],
@@ -769,6 +812,30 @@ def run_live_cycle(
             print_status("SKIP", f"{sym} halted")
             continue
 
+        # Momentum exit: sell if rank faded or score went negative (only for momentum symbols)
+        if sym in momentum_symbols and should_sell_momentum(sym, momentum_scores, momentum_sell_rank):
+            result = client.place_market_sell_quantity(sym, qty)
+            trades_today += 1
+            monitor.trade_count += 1
+            monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "SELL", "strategy": "momentum_exit"})
+            log_trade(
+                symbol=sym, side="SELL",
+                entry_price=entry_price, exit_price=current_price,
+                pnl_pct=pnl_pct, pnl_usd=pnl_usd,
+                amount_usd=pos_value, strategy="momentum_exit",
+            )
+            append_log(
+                log_file, "LIVE_SELL_SUBMITTED",
+                symbol=sym, side="SELL",
+                amount_usd=f"{pos_value:.2f}",
+                order_id=result["orderId"],
+                status="SUBMITTED" if not client.dry_run else "DRY_RUN",
+                details=f"MOMENTUM_EXIT qty={qty:.8f}",
+            )
+            print_status("SELL_SUBMITTED", f"{sym} MOMENTUM_EXIT")
+            sstate["halt_until_day_key_et"] = dkey
+            continue
+
         # Update peak for drawdown tracking
         peak = max(float(sstate.get("peak_value") or 0.0), float(pos_value))
         sstate["peak_value"] = peak
@@ -789,8 +856,6 @@ def run_live_cycle(
         if daily_loss_limit > 0 and daily_ret <= -daily_loss_limit:
             result = client.place_market_sell_quantity(sym, qty)
             trades_today += 1
-            monitor.trade_count += 1
-            monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "SELL", "strategy": "daily_loss_limit", "daily_ret": round(daily_ret, 4)})
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=entry_price, exit_price=current_price,
@@ -814,8 +879,6 @@ def run_live_cycle(
         if max_drawdown > 0 and dd >= max_drawdown:
             result = client.place_market_sell_quantity(sym, qty)
             trades_today += 1
-            monitor.trade_count += 1
-            monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "SELL", "strategy": "max_drawdown", "dd": round(dd, 4)})
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=entry_price, exit_price=current_price,
@@ -909,7 +972,9 @@ def run_live_cycle(
         and buying_power > 50
         and open_positions < max_open_positions
     ):
-        for sym in all_managed:
+        # Buy candidates: union of momentum_symbols and all_managed, ranked by momentum
+        buy_universe = list(dict.fromkeys(momentum_symbols + all_managed))
+        for sym in buy_universe:
             if trades_today >= max_trades_per_day:
                 break
             if open_positions >= max_open_positions:
@@ -925,12 +990,19 @@ def run_live_cycle(
                 append_log(log_file, "SKIP", symbol=sym, details="In cooldown, skipping buy")
                 continue
 
-            df = get_daily_bars(sym)
-            if df is None or len(df) < trend_slow + 5:
+            # Use momentum ranking for buy candidates
+            mom_score = next((ms for ms in momentum_scores if ms.symbol == sym), None)
+            if mom_score is None or not mom_score.valid or mom_score.score <= 0:
+                append_log(log_file, "SKIP", symbol=sym, details="No positive momentum score")
                 continue
 
-            signal = generate_signal(df)
-            if signal != "BUY":
+            # Only buy top_n momentum leaders
+            if mom_score.rank > momentum_top_n:
+                append_log(log_file, "SKIP", symbol=sym, details=f"Momentum rank {mom_score.rank} outside top {momentum_top_n}")
+                continue
+
+            df = get_daily_bars(sym)
+            if df is None or len(df) < trend_slow + 5:
                 continue
 
             atr = calculate_atr(df, atr_period)
@@ -944,9 +1016,6 @@ def run_live_cycle(
                 continue
 
             strength = trend_strength(df, trend_fast, trend_slow)
-            if strength < trend_strong_threshold:
-                append_log(log_file, "SKIP", symbol=sym, details=f"Trend too weak strength={strength:.4f}")
-                continue
 
             remaining_exposure = cap_total - total_exposure
             if remaining_exposure <= 0:
@@ -971,8 +1040,6 @@ def run_live_cycle(
             result = client.place_market_buy_quantity(sym, qty)
             trades_today += 1
             open_positions += 1
-            monitor.trade_count += 1
-            monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "BUY", "price": price, "alloc": alloc_value})
             total_pos_value += alloc_value
             total_exposure = total_pos_value / total_equity
 
@@ -1026,6 +1093,12 @@ def main() -> None:
     trend_fast = get_env_int("TREND_FAST", 5)
     trend_slow = get_env_int("TREND_SLOW", 20)
     trend_strong_threshold = get_env_float("TREND_STRONG_THRESHOLD", 0.5)
+
+    # Momentum-rotation config
+    momentum_symbols_raw = get_env_str("MOMENTUM_SYMBOLS", "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,QQQ,SPY")
+    momentum_symbols = [s.strip().upper() for s in momentum_symbols_raw.split(",") if s.strip()]
+    momentum_top_n = get_env_int("MOMENTUM_TOP_N", 3)
+    momentum_sell_rank = get_env_int("MOMENTUM_SELL_RANK", 5)
 
     take_profit_base = get_env_float("TAKE_PROFIT_BASE", 0.04)
     stop_loss_base = get_env_float("STOP_LOSS_BASE", 0.02)
@@ -1104,6 +1177,9 @@ def main() -> None:
                 log_file=log_file,
                 symbols=symbols,
                 scan_symbols=scan_symbols,
+                momentum_symbols=momentum_symbols,
+                momentum_top_n=momentum_top_n,
+                momentum_sell_rank=momentum_sell_rank,
                 max_trades_per_day=max_trades_per_day,
                 max_order_amount_usd=max_order_amount_usd,
                 max_open_positions=max_open_positions,
@@ -1130,7 +1206,6 @@ def main() -> None:
         except Exception as e:
             append_log(log_file, "ERROR", details=str(e))
             print_status("ERROR", str(e))
-            monitor.log_error("run_live_cycle", e, severity="warning")
 
         if run_once:
             return
@@ -1139,10 +1214,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-        monitor.end_run(status="success")
-    except Exception as e:
-        monitor.log_error("bot_main", e, severity="critical")
-        monitor.end_run(status="failed")
-        raise
+    main()

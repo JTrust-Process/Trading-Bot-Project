@@ -2,17 +2,16 @@ import os
 import requests
 import pandas as pd
 
-API_KEY = os.getenv("TWELVEDATA_API_KEY")
-
 BASE_URL = "https://api.twelvedata.com/time_series"
 
 
 def get_daily_bars(symbol, outputsize=50):
+    api_key = os.getenv("TWELVEDATA_API_KEY")  # read lazily, after load_dotenv()
     params = {
         "symbol": symbol,
         "interval": "1day",
         "outputsize": outputsize,
-        "apikey": API_KEY,
+        "apikey": api_key,
     }
 
     r = requests.get(BASE_URL, params=params)
