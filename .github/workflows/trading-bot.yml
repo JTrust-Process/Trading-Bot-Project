@@ -46,10 +46,13 @@ jobs:
           MOMENTUM_TOP_N: "3"
           MOMENTUM_SELL_RANK: "5"
 
+          # ── Confidence score ───────────────────────────────────────────────
+          CONFIDENCE_MIN_THRESHOLD: "0.3"
+
           # ── Trade sizing ───────────────────────────────────────────────────
           MAX_TRADES_PER_DAY: "10"
-          MAX_ORDER_AMOUNT_USD: "10"
-          MAX_OPEN_POSITIONS: "5"
+          MAX_ORDER_AMOUNT_USD: "10"  # 2 x $10 = $20 max deployed
+          MAX_OPEN_POSITIONS: "2"
           BASE_POSITION_SIZE: "0.10"
           MAX_POSITION_SCALE: "2.0"
 
@@ -73,6 +76,12 @@ jobs:
           REGIME_SYMBOL: "SPY"
           REGIME_FAST: "50"
           REGIME_SLOW: "200"
+
+          # ── Breakout ───────────────────────────────────────────────────────
+          BREAKOUT_LOOKBACK: "20"
+          BREAKOUT_THRESHOLD_BULL: "0.1"
+          BREAKOUT_THRESHOLD_BEAR: "0.3"
+          BREAKOUT_BEAR_SIZE_FACTOR: "0.5"
 
           # ── ATR / trend ────────────────────────────────────────────────────
           ATR_PERIOD: "14"

@@ -629,6 +629,55 @@ def get_avg_cost(pos: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+
+
+# -----------------------------
+# Confidence Score
+# -----------------------------
+def compute_confidence(
+    momentum_score: float,
+    trend_str: float,
+    breakout_margin: float,
+    regime: Optional[str],
+) -> float:
+    """
+    Compute a 0.0–1.0 confidence score combining momentum, trend, and breakout signals.
+
+    momentum_score:   raw momentum score (typically -0.05 to +0.05)
+    trend_str:        trend_strength() output (0.0 to ~0.02)
+    breakout_margin:  how far price cleared the breakout level as % of range (0.0 to 1.0+)
+    regime:           "bull" / "bear" / None
+
+    Returns:
+        confidence in [0.0, 1.0]
+        >= 0.7 → high  → full size
+        0.4–0.7 → medium → 75% size
+        < 0.4  → low   → 50% size
+    """
+    # Normalize each component to 0–1
+    mom_norm = max(0.0, min(1.0, momentum_score / 0.05))      # 0.05 = strong momentum
+    trend_norm = max(0.0, min(1.0, trend_str / 0.01))          # 0.01 = strong trend
+    bo_norm = max(0.0, min(1.0, breakout_margin))               # already 0–1
+
+    # Weighted combination
+    raw = (mom_norm * 0.40) + (trend_norm * 0.30) + (bo_norm * 0.30)
+
+    # Bear regime penalty
+    if regime == "bear":
+        raw *= 0.7
+
+    return round(max(0.0, min(1.0, raw)), 4)
+
+
+def confidence_size_factor(confidence: float) -> float:
+    """Map confidence to position size multiplier."""
+    if confidence >= 0.7:
+        return 1.0    # full size
+    elif confidence >= 0.4:
+        return 0.75   # medium
+    else:
+        return 0.5    # low confidence — half size
+
 # -----------------------------
 # Trading Logic (LIVE)
 # -----------------------------
@@ -662,10 +711,8 @@ def run_live_cycle(
     momentum_symbols: List[str],
     momentum_top_n: int = 3,
     momentum_sell_rank: int = 5,
+    confidence_min_threshold: float = 0.3,
     breakout_lookback: int = 20,
-    breakout_threshold_bull: float = 0.1,
-    breakout_threshold_bear: float = 0.3,
-    breakout_bear_size_factor: float = 0.5,
 ) -> None:
 
     regime = get_market_regime()
@@ -1051,14 +1098,33 @@ def run_live_cycle(
             if remaining_exposure <= 0:
                 break
 
-            # Position sizing: base_position_size * scale, hard-capped by max_order_amount_usd
+            # ── Confidence score ──────────────────────────────────────────
+            bo_margin = 0.0
+            if breakout_result is not None and breakout_result.range_size and breakout_result.range_size > 0:
+                bo_margin = max(0.0, (price - (breakout_result.recent_high or price)) / breakout_result.range_size)
+
+            confidence = compute_confidence(
+                momentum_score=mom_score_val,
+                trend_str=strength,
+                breakout_margin=bo_margin,
+                regime=regime,
+            )
+            conf_factor = confidence_size_factor(confidence)
+
+            if confidence < confidence_min_threshold:
+                append_log(log_file, "SKIP", symbol=sym,
+                    details=f"confidence={confidence:.4f} below min={confidence_min_threshold:.2f}")
+                continue
+
+            # Position sizing: base * scale * confidence factor
             scale = min(1 + (strength / trend_strong_threshold), max_position_scale)
-            alloc_value = min(
+            raw_alloc = min(
                 total_equity * base_position_size * scale,
                 max_order_amount_usd,
                 total_equity * remaining_exposure,
                 buying_power * 0.95,
             )
+            alloc_value = raw_alloc * conf_factor * breakout_size_factor
 
             if alloc_value < 1.0:
                 continue
@@ -1077,7 +1143,7 @@ def run_live_cycle(
                 symbol=sym, side="BUY",
                 entry_price=price, exit_price=None,
                 pnl_pct=None, pnl_usd=None,
-                amount_usd=alloc_value, strategy="default",
+                amount_usd=alloc_value, strategy=signal_type,
             )
             append_log(
                 log_file, "LIVE_BUY_SUBMITTED",
@@ -1085,9 +1151,9 @@ def run_live_cycle(
                 amount_usd=f"{alloc_value:.2f}",
                 order_id=result["orderId"],
                 status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"signal=BUY strength={strength:.4f} scale={scale:.2f} alloc={alloc_value:.2f} price={price:.4f}",
+                details=f"signal={signal_type} confidence={confidence:.4f} conf_factor={conf_factor:.2f} strength={strength:.4f} scale={scale:.2f} alloc={alloc_value:.2f} price={price:.4f}",
             )
-            print_status("BUY_SUBMITTED", f"{sym} alloc=${alloc_value:.2f} qty={qty:.8f} scale={scale:.2f}")
+            print_status("BUY_SUBMITTED", f"{sym} alloc=${alloc_value:.2f} confidence={confidence:.4f} signal={signal_type}")
 
     save_state(state)
 
@@ -1130,11 +1196,11 @@ def main() -> None:
     momentum_top_n = get_env_int("MOMENTUM_TOP_N", 3)
     momentum_sell_rank = get_env_int("MOMENTUM_SELL_RANK", 5)
 
+    # Confidence score config
+    confidence_min_threshold = get_env_float("CONFIDENCE_MIN_THRESHOLD", 0.3)
+
     # Breakout config
     breakout_lookback = get_env_int("BREAKOUT_LOOKBACK", 20)
-    breakout_threshold_bull = get_env_float("BREAKOUT_THRESHOLD_BULL", 0.1)
-    breakout_threshold_bear = get_env_float("BREAKOUT_THRESHOLD_BEAR", 0.3)
-    breakout_bear_size_factor = get_env_float("BREAKOUT_BEAR_SIZE_FACTOR", 0.5)
 
     take_profit_base = get_env_float("TAKE_PROFIT_BASE", 0.04)
     stop_loss_base = get_env_float("STOP_LOSS_BASE", 0.02)
@@ -1216,10 +1282,8 @@ def main() -> None:
                 momentum_symbols=momentum_symbols,
                 momentum_top_n=momentum_top_n,
                 momentum_sell_rank=momentum_sell_rank,
+                confidence_min_threshold=confidence_min_threshold,
                 breakout_lookback=breakout_lookback,
-                breakout_threshold_bull=breakout_threshold_bull,
-                breakout_threshold_bear=breakout_threshold_bear,
-                breakout_bear_size_factor=breakout_bear_size_factor,
                 max_trades_per_day=max_trades_per_day,
                 max_order_amount_usd=max_order_amount_usd,
                 max_open_positions=max_open_positions,
