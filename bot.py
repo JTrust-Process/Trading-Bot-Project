@@ -168,9 +168,42 @@ def append_log(
     details: str = "",
 ) -> None:
     ensure_log_header(log_file)
+    ts = utcnow().isoformat()
     with open(log_file, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow([utcnow().isoformat(), event, symbol, side, amount_usd, order_id, status, details])
+        w.writerow([ts, event, symbol, side, amount_usd, order_id, status, details])
+    _log_to_supabase(ts, event, symbol=symbol, side=side, amount_usd=amount_usd,
+                     order_id=order_id, status=status, details=details)
+
+
+def _log_to_supabase(
+    ts: str,
+    event: str,
+    *,
+    symbol: str = "",
+    side: str = "",
+    amount_usd: str = "",
+    order_id: str = "",
+    status: str = "",
+    details: str = "",
+) -> None:
+    """Write a log entry to Supabase bot_logs. Never crashes the bot."""
+    global supabase
+    if supabase is None:
+        return
+    try:
+        supabase.table("bot_logs").insert({
+            "timestamp_utc": ts,
+            "event": event,
+            "symbol": symbol or None,
+            "side": side or None,
+            "amount_usd": amount_usd or None,
+            "order_id": order_id or None,
+            "status": status or None,
+            "details": details or None,
+        }).execute()
+    except Exception as e:
+        print_status("SUPABASE_LOG_ERROR", str(e))
 
 
 def print_status(event: str, details: str = "") -> None:
