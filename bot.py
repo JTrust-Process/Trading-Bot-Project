@@ -1221,4 +1221,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        monitor.log_error("bot_main", e, severity="critical")
+        raise
+    finally:
+        # Always mark the run as complete, even if killed or crashed
+        try:
+            monitor.end_run()
+        except Exception:
+            pass
