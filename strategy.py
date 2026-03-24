@@ -2,12 +2,8 @@ import numpy as np
 import pandas as pd
 import os
 
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", 14))
-TREND_FAST = int(os.getenv("TREND_FAST", 5))
-TREND_SLOW = int(os.getenv("TREND_SLOW", 20))
 
-
-def calculate_atr(df, period = 14):
+def calculate_atr(df, period=14):
     high = df["high"]
     low = df["low"]
     close = df["close"]
@@ -36,10 +32,13 @@ def trend_strength(df, fast=5, slow=20):
     return float(strength)
 
 
-
 def generate_signal(df):
-    sma_fast = df["close"].rolling(TREND_FAST).mean()
-    sma_slow = df["close"].rolling(TREND_SLOW).mean()
+    """Legacy signal function — kept for backtest.py compatibility."""
+    fast = int(os.getenv("TREND_FAST", "5"))
+    slow = int(os.getenv("TREND_SLOW", "20"))
+
+    sma_fast = df["close"].rolling(fast).mean()
+    sma_slow = df["close"].rolling(slow).mean()
 
     if sma_fast.iloc[-1] > sma_slow.iloc[-1]:
         return "BUY"

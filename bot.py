@@ -11,7 +11,7 @@ import requests
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from market_data import get_daily_bars
-from strategy import calculate_atr, trend_strength, generate_signal
+from strategy import calculate_atr, trend_strength
 from momentum import rank_symbols, get_buy_candidates, should_sell_momentum, MomentumScore
 from breakout import check_breakout, BreakoutResult
 from supabase import create_client
