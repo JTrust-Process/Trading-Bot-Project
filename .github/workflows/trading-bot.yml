@@ -37,7 +37,7 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
           # ── Symbols ────────────────────────────────────────────────────────
-          SYMBOLS: "CMCSA,COP,CVX,DUK,ITOT,IVV,KO,MDT,MO,PEP,PM,QQQ,SCHB,SCHD,SGOV,SPY,VOO,VTI,VXUS,VZ"
+          SYMBOLS: "QQQ,SCHB,SCHD,SGOV,SPY,VTI"
           SCAN_SYMBOLS: "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA"
           MANAGE_ALL_POSITIONS: "true"
 
