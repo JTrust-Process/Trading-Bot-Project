@@ -1018,6 +1018,7 @@ def run_live_cycle(
 
     if (
         trades_today < max_trades_per_day
+        and regime == "bull"
         and total_exposure < cap_total
         and buying_power > 50
         and open_positions < max_open_positions
@@ -1044,16 +1045,14 @@ def run_live_cycle(
             mom_score = next((ms for ms in momentum_scores if ms.symbol == sym), None)
             mom_score_val = mom_score.score if (mom_score and mom_score.valid) else -999.0
 
-            # Momentum buys require bull regime
             momentum_signal = (
-                regime == "bull"
-                and mom_score is not None
+                mom_score is not None
                 and mom_score.valid
                 and mom_score.score > 0
                 and mom_score.rank <= momentum_top_n
             )
 
-            # Breakout runs in both bull and bear (bear has stricter threshold + half size)
+            # Only run breakout check if momentum didn't already qualify
             breakout_result = None
             breakout_signal = False
             breakout_size_factor = 1.0
@@ -1081,12 +1080,14 @@ def run_live_cycle(
 
             df = get_daily_bars(sym)
             if df is None or len(df) < trend_slow + 5:
+                append_log(log_file, "SKIP", symbol=sym, details=f"no price data or insufficient bars (got {len(df) if df is not None else 0})")
                 continue
 
             atr = calculate_atr(df, atr_period)
             price = float(df["close"].iloc[-1])
 
             if price <= 0 or atr is None:
+                append_log(log_file, "SKIP", symbol=sym, details="invalid price or ATR")
                 continue
 
             if atr / price < atr_vol_threshold:
