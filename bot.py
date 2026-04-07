@@ -1014,11 +1014,12 @@ def run_live_cycle(
     # ----------------------------------------------------------
     # ENTRY LOGIC
     # ----------------------------------------------------------
+    # ── Entry scan diagnostic ────────────────────────────────────────────────
     open_positions = count_open_positions(portfolio, all_managed)
+    append_log(log_file, "ENTRY_SCAN", details=f"trades_today={trades_today} regime={regime} exposure={total_exposure:.2%} cap={cap_total:.2%} bp={buying_power:.2f} open={open_positions}/{max_open_positions}")
 
     if (
         trades_today < max_trades_per_day
-        and regime == "bull"
         and total_exposure < cap_total
         and buying_power > 50
         and open_positions < max_open_positions
@@ -1045,14 +1046,16 @@ def run_live_cycle(
             mom_score = next((ms for ms in momentum_scores if ms.symbol == sym), None)
             mom_score_val = mom_score.score if (mom_score and mom_score.valid) else -999.0
 
+            # Momentum buys require bull regime
             momentum_signal = (
-                mom_score is not None
+                regime == "bull"
+                and mom_score is not None
                 and mom_score.valid
                 and mom_score.score > 0
                 and mom_score.rank <= momentum_top_n
             )
 
-            # Only run breakout check if momentum didn't already qualify
+            # Breakout runs in both bull and bear (bear has stricter threshold + half size)
             breakout_result = None
             breakout_signal = False
             breakout_size_factor = 1.0
