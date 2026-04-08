@@ -1,32 +1,39 @@
-import os
-import requests
+import yfinance as yf
 import pandas as pd
 
-BASE_URL = "https://api.twelvedata.com/time_series"
 
+def get_daily_bars(symbol: str, outputsize: int = 50) -> pd.DataFrame | None:
+    """
+    Fetch daily OHLCV bars using yfinance.
+    Completely free, no API key, no rate limits for daily data.
+    Returns a DataFrame with columns: open, high, low, close, volume
+    sorted oldest → newest, or None if data unavailable.
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        # Request enough history to cover outputsize bars
+        df = ticker.history(period="3mo", interval="1d")
 
-def get_daily_bars(symbol, outputsize=50):
-    api_key = os.getenv("TWELVEDATA_API_KEY")  # read lazily, after load_dotenv()
-    params = {
-        "symbol": symbol,
-        "interval": "1day",
-        "outputsize": outputsize,
-        "apikey": api_key,
-    }
+        if df is None or df.empty:
+            return None
 
-    r = requests.get(BASE_URL, params=params)
-    data = r.json()
+        # Normalize column names to lowercase to match existing bot expectations
+        df = df.rename(columns={
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume",
+        })
 
-    if "values" not in data:
+        df = df[["open", "high", "low", "close", "volume"]].copy()
+        df = df.dropna(subset=["close"])
+
+        # Sort oldest → newest and return last outputsize bars
+        df = df.sort_index()
+        df = df.tail(outputsize).reset_index(drop=True)
+
+        return df if len(df) > 0 else None
+
+    except Exception:
         return None
-
-    df = pd.DataFrame(data["values"])
-    df = df.astype({
-        "open": float,
-        "high": float,
-        "low": float,
-        "close": float,
-    })
-    df = df.sort_values("datetime")
-    df.reset_index(drop=True, inplace=True)
-    return df

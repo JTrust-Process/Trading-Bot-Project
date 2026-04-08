@@ -32,7 +32,6 @@ jobs:
 
           # ── Secrets ────────────────────────────────────────────────────────
           PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
-          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
