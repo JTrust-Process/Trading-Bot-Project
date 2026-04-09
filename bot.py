@@ -451,7 +451,10 @@ class PublicClient:
         return resp.json()
 
     def deterministic_order_id(self, account_id: str, side: str, symbol: str) -> str:
-        seed = f"{account_id}:{today_key_et()}:{side}:{symbol}"
+        # Include minute-level timestamp to avoid duplicate order ID rejections
+        # on multiple runs within the same day
+        now_min = datetime.now(NY_TZ).strftime("%Y-%m-%d-%H-%M")
+        seed = f"{account_id}:{now_min}:{side}:{symbol}"
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
     def place_market_buy_quantity(self, symbol: str, quantity: float) -> Dict[str, Any]:
@@ -865,7 +868,13 @@ def run_live_cycle(
 
         # Momentum exit: sell if rank faded or score went negative (only for momentum symbols)
         if sym in momentum_symbols and should_sell_momentum(sym, momentum_scores, momentum_sell_rank):
-            result = client.place_market_sell_quantity(sym, qty)
+            try:
+                result = client.place_market_sell_quantity(sym, qty)
+            except Exception as order_err:
+                append_log(log_file, "ORDER_ERROR", symbol=sym,
+                    details=f"MOMENTUM_EXIT sell failed: {order_err}")
+                monitor.log_error("place_sell_momentum", order_err, symbol=sym, severity="warning")
+                continue
             trades_today += 1
             monitor.trade_count += 1
             monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "SELL", "strategy": "momentum_exit"})
@@ -1135,7 +1144,14 @@ def run_live_cycle(
             if qty <= 0:
                 continue
 
-            result = client.place_market_buy_quantity(sym, qty)
+            try:
+                result = client.place_market_buy_quantity(sym, qty)
+            except Exception as order_err:
+                append_log(log_file, "ORDER_ERROR", symbol=sym,
+                    details=f"BUY failed: {order_err} qty={qty:.8f} alloc={alloc_value:.2f} price={price:.4f}")
+                monitor.log_error("place_buy", order_err, symbol=sym, severity="warning")
+                continue
+
             trades_today += 1
             open_positions += 1
             total_pos_value += alloc_value
