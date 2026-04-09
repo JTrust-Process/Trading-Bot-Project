@@ -11,13 +11,15 @@ def get_daily_bars(symbol: str, outputsize: int = 50) -> pd.DataFrame | None:
     """
     try:
         ticker = yf.Ticker(symbol)
-        # Request enough history to cover outputsize bars
-        df = ticker.history(period="3mo", interval="1d")
+
+        # Use 1y to cover up to 250 bars (enough for 200-day SMA + buffer)
+        # For smaller requests this is still fast since yfinance caches well
+        df = ticker.history(period="1y", interval="1d")
 
         if df is None or df.empty:
             return None
 
-        # Normalize column names to lowercase to match existing bot expectations
+        # Normalize column names to lowercase
         df = df.rename(columns={
             "Open": "open",
             "High": "high",
