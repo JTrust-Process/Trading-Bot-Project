@@ -34,7 +34,6 @@ jobs:
           PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
           # ── Symbols ────────────────────────────────────────────────────────
           SYMBOLS: "QQQ,SCHB,SCHD,SGOV,SPY,VTI"
@@ -49,7 +48,7 @@ jobs:
           # ── Trade sizing ───────────────────────────────────────────────────
           MAX_TRADES_PER_DAY: "10"
           MAX_ORDER_AMOUNT_USD: "10"
-          MAX_OPEN_POSITIONS: "5"
+          MAX_OPEN_POSITIONS: "8"
           BASE_POSITION_SIZE: "0.10"
           MAX_POSITION_SCALE: "2.0"
 
