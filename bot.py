@@ -451,21 +451,23 @@ class PublicClient:
         return resp.json()
 
     def deterministic_order_id(self, account_id: str, side: str, symbol: str) -> str:
-        seed = f"{account_id}:{today_key_et()}:{side}:{symbol}"
+        now_min = datetime.now(NY_TZ).strftime("%Y-%m-%d-%H-%M")
+        seed = f"{account_id}:{now_min}:{side}:{symbol}"
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
-    def place_market_buy_quantity(self, symbol: str, quantity: float) -> Dict[str, Any]:
+    def place_market_buy_quantity(self, symbol: str, quantity: float, price: float = 0.0) -> Dict[str, Any]:
         if quantity <= 0:
             raise ValueError("quantity must be > 0")
         account_id = self.get_account_id()
         order_id = self.deterministic_order_id(account_id, "BUY", symbol)
+        notional = round(quantity * price, 2) if price > 0 else round(quantity, 2)
         payload = {
             "orderId": order_id,
             "instrument": {"symbol": symbol, "type": "EQUITY"},
             "orderSide": "BUY",
             "orderType": "MARKET",
             "expiration": {"timeInForce": "DAY"},
-            "quantity": f"{quantity:.8f}",
+            "amount": f"{notional:.2f}",
         }
         if self.dry_run:
             return {"orderId": order_id, "response": {"dry_run": True, "payload": payload}}
@@ -810,12 +812,7 @@ def run_live_cycle(
                 break
             sym = snap["symbol"]
             qty = snap["qty"]
-            try:
-                result = client.place_market_sell_quantity(sym, qty)
-            except Exception as sell_err:
-                append_log(log_file, "ORDER_ERROR", symbol=sym, details=f"LOCKDOWN sell failed: {sell_err}")
-                monitor.log_error("place_sell_lockdown", sell_err, symbol=sym, severity="warning")
-                continue
+            result = client.place_market_sell_quantity(sym, qty)
             trades_today += 1
             log_trade(
                 symbol=sym, side="SELL",
@@ -870,7 +867,12 @@ def run_live_cycle(
 
         # Momentum exit: sell if rank faded or score went negative (only for momentum symbols)
         if sym in momentum_symbols and should_sell_momentum(sym, momentum_scores, momentum_sell_rank):
-            result = client.place_market_sell_quantity(sym, qty)
+            try:
+                result = client.place_market_sell_quantity(sym, qty)
+            except Exception as sell_err:
+                append_log(log_file, "ORDER_ERROR", symbol=sym, details=f"MOMENTUM_EXIT sell failed: {sell_err}")
+                monitor.log_error("place_sell_momentum", sell_err, symbol=sym, severity="warning")
+                continue
             trades_today += 1
             monitor.trade_count += 1
             monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "SELL", "strategy": "momentum_exit"})
@@ -1040,12 +1042,12 @@ def run_live_cycle(
     # ENTRY LOGIC
     # ----------------------------------------------------------
     open_positions = count_open_positions(portfolio, all_managed)
+    append_log(log_file, "ENTRY_SCAN", details=f"trades_today={trades_today} regime={regime} exposure={total_exposure:.2%} cap={cap_total:.2%} bp={buying_power:.2f} open={open_positions}/{max_open_positions}")
 
     if (
         trades_today < max_trades_per_day
-        and regime == "bull"
         and total_exposure < cap_total
-        and buying_power > 50
+        and buying_power > 5
         and open_positions < max_open_positions
     ):
         # Buy candidates: union of momentum_symbols and all_managed, ranked by momentum
@@ -1070,8 +1072,10 @@ def run_live_cycle(
             mom_score = next((ms for ms in momentum_scores if ms.symbol == sym), None)
             mom_score_val = mom_score.score if (mom_score and mom_score.valid) else -999.0
 
+            # Momentum buys require bull regime
             momentum_signal = (
-                mom_score is not None
+                regime == "bull"
+                and mom_score is not None
                 and mom_score.valid
                 and mom_score.score > 0
                 and mom_score.rank <= momentum_top_n
@@ -1160,7 +1164,13 @@ def run_live_cycle(
             if qty <= 0:
                 continue
 
-            result = client.place_market_buy_quantity(sym, qty)
+            try:
+                result = client.place_market_buy_quantity(sym, qty, price)
+            except Exception as order_err:
+                append_log(log_file, "ORDER_ERROR", symbol=sym,
+                    details=f"BUY failed: {order_err} qty={qty:.8f} alloc={alloc_value:.2f} price={price:.4f}")
+                monitor.log_error("place_buy", order_err, symbol=sym, severity="warning")
+                continue
             trades_today += 1
             open_positions += 1
             total_pos_value += alloc_value
