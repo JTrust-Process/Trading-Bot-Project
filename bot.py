@@ -16,10 +16,6 @@ from momentum import rank_symbols, get_buy_candidates, should_sell_momentum, Mom
 from breakout import check_breakout, BreakoutResult
 from supabase import create_client
 from monitor import monitor
-from notify import (
-    notify_buy, notify_sell, notify_run_start,
-    notify_run_end, notify_error, notify_regime_change,
-)
 
 
 # -----------------------------
@@ -37,7 +33,6 @@ STOP_FILE = "STOP.txt"
 
 # Supabase client — initialized after load_dotenv() in main()
 supabase = None
-_last_regime: str | None = None  # track regime changes for notifications
 
 
 # -----------------------------
@@ -720,12 +715,8 @@ def run_live_cycle(
     breakout_lookback: int = 20,
 ) -> None:
 
-    global _last_regime
     regime = get_market_regime()
     print_status("MARKET_REGIME", str(regime))
-    if regime != _last_regime:
-        notify_regime_change(_last_regime, regime)
-        _last_regime = regime
 
     # ── Momentum ranking (computed once per cycle) ───────────────────────────
     momentum_scores = rank_symbols(momentum_symbols)
@@ -794,13 +785,6 @@ def run_live_cycle(
 
     total_exposure = total_pos_value / total_equity if total_equity > 0 else 0.0
 
-    notify_run_start(
-        symbols=all_managed[:5],
-        regime=regime,
-        equity=total_equity,
-        buying_power=buying_power,
-    )
-
     append_log(
         log_file, "PORTFOLIO",
         details=(
@@ -826,7 +810,12 @@ def run_live_cycle(
                 break
             sym = snap["symbol"]
             qty = snap["qty"]
-            result = client.place_market_sell_quantity(sym, qty)
+            try:
+                result = client.place_market_sell_quantity(sym, qty)
+            except Exception as sell_err:
+                append_log(log_file, "ORDER_ERROR", symbol=sym, details=f"LOCKDOWN sell failed: {sell_err}")
+                monitor.log_error("place_sell_lockdown", sell_err, symbol=sym, severity="warning")
+                continue
             trades_today += 1
             log_trade(
                 symbol=sym, side="SELL",
@@ -900,7 +889,6 @@ def run_live_cycle(
                 details=f"MOMENTUM_EXIT qty={qty:.8f}",
             )
             print_status("SELL_SUBMITTED", f"{sym} MOMENTUM_EXIT")
-            notify_sell(sym, current_price or 0, pnl_pct, pnl_usd, pos_value, "momentum_exit")
             sstate["halt_until_day_key_et"] = dkey
             continue
 
@@ -922,7 +910,12 @@ def run_live_cycle(
 
         # Kill switch: daily loss limit
         if daily_loss_limit > 0 and daily_ret <= -daily_loss_limit:
-            result = client.place_market_sell_quantity(sym, qty)
+            try:
+                result = client.place_market_sell_quantity(sym, qty)
+            except Exception as sell_err:
+                append_log(log_file, "ORDER_ERROR", symbol=sym, details=f"DAILY_LOSS_LIMIT sell failed: {sell_err}")
+                monitor.log_error("place_sell_daily_loss", sell_err, symbol=sym, severity="warning")
+                continue
             trades_today += 1
             log_trade(
                 symbol=sym, side="SELL",
@@ -945,7 +938,12 @@ def run_live_cycle(
 
         # Kill switch: max drawdown
         if max_drawdown > 0 and dd >= max_drawdown:
-            result = client.place_market_sell_quantity(sym, qty)
+            try:
+                result = client.place_market_sell_quantity(sym, qty)
+            except Exception as sell_err:
+                append_log(log_file, "ORDER_ERROR", symbol=sym, details=f"MAX_DRAWDOWN sell failed: {sell_err}")
+                monitor.log_error("place_sell_max_drawdown", sell_err, symbol=sym, severity="warning")
+                continue
             trades_today += 1
             log_trade(
                 symbol=sym, side="SELL",
@@ -988,7 +986,12 @@ def run_live_cycle(
         dynamic_sl = stop_loss_base * (0.8 if regime == "bear" else 1.0)
 
         if pnl_pct >= dynamic_tp:
-            result = client.place_market_sell_quantity(sym, qty)
+            try:
+                result = client.place_market_sell_quantity(sym, qty)
+            except Exception as sell_err:
+                append_log(log_file, "ORDER_ERROR", symbol=sym, details=f"DYNAMIC_TP sell failed: {sell_err}")
+                monitor.log_error("place_sell_tp", sell_err, symbol=sym, severity="warning")
+                continue
             trades_today += 1
             log_trade(
                 symbol=sym, side="SELL",
@@ -1005,11 +1008,15 @@ def run_live_cycle(
                 details=f"DYNAMIC_TP pnl={pnl_pct:.2%} tp={dynamic_tp:.2%}",
             )
             print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_TP pnl={pnl_pct:.2%}")
-            notify_sell(sym, current_price, pnl_pct, pnl_usd, pos_value, "dynamic_tp")
             sstate["halt_until_day_key_et"] = dkey
 
         elif pnl_pct <= -dynamic_sl:
-            result = client.place_market_sell_quantity(sym, qty)
+            try:
+                result = client.place_market_sell_quantity(sym, qty)
+            except Exception as sell_err:
+                append_log(log_file, "ORDER_ERROR", symbol=sym, details=f"DYNAMIC_SL sell failed: {sell_err}")
+                monitor.log_error("place_sell_sl", sell_err, symbol=sym, severity="warning")
+                continue
             trades_today += 1
             log_trade(
                 symbol=sym, side="SELL",
@@ -1026,7 +1033,6 @@ def run_live_cycle(
                 details=f"DYNAMIC_SL pnl={pnl_pct:.2%} sl={dynamic_sl:.2%}",
             )
             print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_SL pnl={pnl_pct:.2%}")
-            notify_sell(sym, current_price, pnl_pct, pnl_usd, pos_value, "dynamic_sl")
             sstate["halt_until_day_key_et"] = dkey
             trigger_cooldown(sstate, loss_cooldown_days)
 
@@ -1175,7 +1181,6 @@ def run_live_cycle(
                 details=f"signal={signal_type} confidence={confidence:.4f} conf_factor={conf_factor:.2f} strength={strength:.4f} scale={scale:.2f} alloc={alloc_value:.2f} price={price:.4f}",
             )
             print_status("BUY_SUBMITTED", f"{sym} alloc=${alloc_value:.2f} confidence={confidence:.4f} signal={signal_type}")
-            notify_buy(sym, price, alloc_value, signal_type, confidence)
 
     save_state(state)
 
@@ -1349,14 +1354,5 @@ if __name__ == "__main__":
         # Always mark the run as complete, even if killed or crashed
         try:
             monitor.end_run()
-        except Exception:
-            pass
-        try:
-            notify_run_end(
-                status="failed" if monitor.critical_error else "warning" if monitor.error_count > 0 else "success",
-                trades=monitor.trade_count,
-                errors=monitor.error_count,
-                duration_ms=int((datetime.now(timezone.utc) - monitor.start_time).total_seconds() * 1000) if monitor.start_time else 0,
-            )
         except Exception:
             pass
