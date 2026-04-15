@@ -514,18 +514,23 @@ class PublicClient:
 # Portfolio helpers
 # -----------------------------
 def get_market_regime() -> Optional[str]:
-    """Returns 'bull', 'bear', or None if data unavailable."""
+    """
+    Returns 'bull', 'bear', or None if data unavailable.
+    Uses SPY price vs 50-day SMA (fits within Alpha Vantage free tier 100-bar limit).
+    Bull = price above 50 SMA, Bear = price below 50 SMA.
+    """
     try:
         regime_symbol = os.getenv("REGIME_SYMBOL", "SPY")
-        fast = int(os.getenv("REGIME_FAST", "50"))
-        slow = int(os.getenv("REGIME_SLOW", "200"))
-        df = get_daily_bars(regime_symbol, max(fast, slow) + 5)
-        if df is None or len(df) < slow:
-            print_status("REGIME", "insufficient data")
+        sma_period = 50  # must fit within 100-bar compact limit
+        df = get_daily_bars(regime_symbol, sma_period + 10)
+        if df is None or len(df) < sma_period:
+            print_status("REGIME", f"insufficient data (got {len(df) if df is not None else 0} bars)")
             return None
-        ma_fast = df["close"].rolling(fast).mean().iloc[-1]
-        ma_slow = df["close"].rolling(slow).mean().iloc[-1]
-        return "bull" if ma_fast > ma_slow else "bear"
+        sma = df["close"].rolling(sma_period).mean().iloc[-1]
+        price = df["close"].iloc[-1]
+        regime = "bull" if price > sma else "bear"
+        print_status("REGIME", f"price={price:.2f} sma50={sma:.2f} -> {regime}")
+        return regime
     except Exception as e:
         print_status("REGIME_ERROR", str(e))
         return None
@@ -1080,7 +1085,10 @@ def run_live_cycle(
     # ENTRY LOGIC
     # ----------------------------------------------------------
     open_positions = count_open_positions(portfolio, all_managed)
-    append_log(log_file, "ENTRY_SCAN", details=f"trades_today={trades_today} regime={regime} exposure={total_exposure:.2%} cap={cap_total:.2%} bp={buying_power:.2f} open={open_positions}/{max_open_positions}")
+    _exp_str = f"{total_exposure:.2%}" if total_exposure is not None else "None"
+    _cap_str = f"{cap_total:.2%}" if cap_total is not None else "None"
+    _bp_str  = f"{buying_power:.2f}" if buying_power is not None else "None"
+    append_log(log_file, "ENTRY_SCAN", details=f"trades_today={trades_today} regime={regime} exposure={_exp_str} cap={_cap_str} bp={_bp_str} open={open_positions}/{max_open_positions}")
 
     # Keep a $25 buffer to avoid margin calls (maintenance requirement cushion)
     MARGIN_BUFFER = 25.0
