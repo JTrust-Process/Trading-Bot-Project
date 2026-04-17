@@ -887,7 +887,9 @@ def run_live_cycle(
             continue
 
         # Momentum exit: sell if rank faded or score went negative (only for momentum symbols)
-        if sym in momentum_symbols and should_sell_momentum(sym, momentum_scores, momentum_sell_rank):
+        # Don't momentum_exit at a loss — let stop loss handle it to avoid fee drag
+        FEE_BUFFER = 0.005  # 0.5% minimum gain to cover fees before momentum exit
+        if sym in momentum_symbols and should_sell_momentum(sym, momentum_scores, momentum_sell_rank) and (pnl_pct is None or pnl_pct >= FEE_BUFFER):
             try:
                 result = client.place_market_sell_quantity(sym, qty)
             except Exception as sell_err:
@@ -899,7 +901,7 @@ def run_live_cycle(
             monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "SELL", "strategy": "momentum_exit"})
             true_entry = sstate.get("entry_price") or entry_price
             true_amount = sstate.get("entry_amount") or pos_value
-            true_pnl_pct = ((current_price - true_entry) / true_entry) if true_entry and current_price else pnl_pct
+            true_pnl_pct = ((current_price - true_entry) / true_entry) if (true_entry and current_price and true_entry > 0) else pnl_pct
             true_pnl_usd = (true_pnl_pct * true_amount) if true_pnl_pct is not None else pnl_usd
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
@@ -915,9 +917,9 @@ def run_live_cycle(
                 amount_usd=f"{true_amount:.2f}",
                 order_id=result["orderId"],
                 status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"MOMENTUM_EXIT entry={true_entry:.2f} exit={current_price:.2f} pnl={true_pnl_pct:.2%} qty={qty:.8f}",
+                details=f"MOMENTUM_EXIT entry={true_entry or 0:.2f} exit={current_price or 0:.2f} pnl={true_pnl_pct or 0:.2%} qty={qty:.8f}",
             )
-            print_status("SELL_SUBMITTED", f"{sym} MOMENTUM_EXIT pnl={true_pnl_pct:.2%}")
+            print_status("SELL_SUBMITTED", f"{sym} MOMENTUM_EXIT pnl={true_pnl_pct or 0:.2%}")
             notify_sell(sym, current_price or 0, true_pnl_pct, true_pnl_usd, true_amount, "momentum_exit")
             sstate["halt_until_day_key_et"] = dkey
             continue
@@ -934,7 +936,8 @@ def run_live_cycle(
             log_file, "SYMBOL_STATE", symbol=sym,
             details=(
                 f"value={pos_value:.2f} daily_ret={daily_ret:.2%} "
-                f"dd={dd:.2%} peak={peak:.2f} start={start_val:.2f}"
+                f"dd={dd:.2%} peak={peak:.2f} start={start_val:.2f} "
+                f"last={current_price or 'N/A'} avg_cost={entry_price or 'N/A'}"
             ),
         )
 
@@ -959,7 +962,7 @@ def run_live_cycle(
                 amount_usd=f"{pos_value:.2f}",
                 order_id=result["orderId"],
                 status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"DAILY_LOSS_LIMIT daily_ret={daily_ret:.4%} qty={qty:.8f}",
+                details=f"DAILY_LOSS_LIMIT entry={entry_price or 0:.2f} exit={current_price or 0:.2f} daily_ret={daily_ret:.4%} qty={qty:.8f}",
             )
             print_status("SELL_SUBMITTED", f"{sym} DAILY_LOSS_LIMIT daily={daily_ret:.2%}")
             sstate["halt_until_day_key_et"] = dkey
@@ -987,7 +990,7 @@ def run_live_cycle(
                 amount_usd=f"{pos_value:.2f}",
                 order_id=result["orderId"],
                 status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"MAX_DRAWDOWN dd={dd:.4%} qty={qty:.8f}",
+                details=f"MAX_DRAWDOWN entry={entry_price or 0:.2f} exit={current_price or 0:.2f} dd={dd:.4%} qty={qty:.8f}",
             )
             print_status("SELL_SUBMITTED", f"{sym} MAX_DRAWDOWN dd={dd:.2%}")
             sstate["halt_until_day_key_et"] = dkey
@@ -1015,7 +1018,9 @@ def run_live_cycle(
         dynamic_tp = take_profit_base * (1 + 0.5 * min(scale - 1, 1.5))
         dynamic_sl = stop_loss_base * (0.8 if regime == "bear" else 1.0)
 
-        if pnl_pct >= dynamic_tp:
+        # Add fee buffer so we only TP if gain meaningfully exceeds fees
+        fee_adjusted_tp = dynamic_tp + 0.003  # ~0.3% fee buffer per round trip
+        if pnl_pct >= fee_adjusted_tp:
             try:
                 result = client.place_market_sell_quantity(sym, qty)
             except Exception as sell_err:
@@ -1026,7 +1031,7 @@ def run_live_cycle(
             # Use stored entry price for accurate PnL if available
             true_entry = sstate.get("entry_price") or entry_price
             true_amount = sstate.get("entry_amount") or pos_value
-            true_pnl_pct = ((current_price - true_entry) / true_entry) if true_entry and current_price else pnl_pct
+            true_pnl_pct = ((current_price - true_entry) / true_entry) if (true_entry and current_price and true_entry > 0) else pnl_pct
             true_pnl_usd = (true_pnl_pct * true_amount) if true_pnl_pct is not None else pnl_usd
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
@@ -1042,10 +1047,10 @@ def run_live_cycle(
                 amount_usd=f"{true_amount:.2f}",
                 order_id=result["orderId"],
                 status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"DYNAMIC_TP entry={true_entry:.2f} exit={current_price:.2f} pnl={true_pnl_pct:.2%} tp={dynamic_tp:.2%}",
+                details=f"DYNAMIC_TP entry={true_entry or 0:.2f} exit={current_price or 0:.2f} pnl={true_pnl_pct or 0:.2%} tp={fee_adjusted_tp:.2%} (base={dynamic_tp:.2%})",
             )
-            print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_TP pnl={true_pnl_pct:.2%}")
-            notify_sell(sym, current_price, true_pnl_pct, true_pnl_usd, true_amount, "dynamic_tp")
+            print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_TP pnl={true_pnl_pct or 0:.2%}")
+            notify_sell(sym, current_price or 0, true_pnl_pct, true_pnl_usd, true_amount, "dynamic_tp")
             sstate["halt_until_day_key_et"] = dkey
 
         elif pnl_pct <= -dynamic_sl:
@@ -1058,7 +1063,7 @@ def run_live_cycle(
             trades_today += 1
             true_entry = sstate.get("entry_price") or entry_price
             true_amount = sstate.get("entry_amount") or pos_value
-            true_pnl_pct = ((current_price - true_entry) / true_entry) if true_entry and current_price else pnl_pct
+            true_pnl_pct = ((current_price - true_entry) / true_entry) if (true_entry and current_price and true_entry > 0) else pnl_pct
             true_pnl_usd = (true_pnl_pct * true_amount) if true_pnl_pct is not None else pnl_usd
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
@@ -1074,10 +1079,10 @@ def run_live_cycle(
                 amount_usd=f"{true_amount:.2f}",
                 order_id=result["orderId"],
                 status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"DYNAMIC_SL entry={true_entry:.2f} exit={current_price:.2f} pnl={true_pnl_pct:.2%} sl={dynamic_sl:.2%}",
+                details=f"DYNAMIC_SL entry={true_entry or 0:.2f} exit={current_price or 0:.2f} pnl={true_pnl_pct or 0:.2%} sl={dynamic_sl:.2%}",
             )
-            print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_SL pnl={true_pnl_pct:.2%}")
-            notify_sell(sym, current_price, true_pnl_pct, true_pnl_usd, true_amount, "dynamic_sl")
+            print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_SL pnl={true_pnl_pct or 0:.2%}")
+            notify_sell(sym, current_price or 0, true_pnl_pct, true_pnl_usd, true_amount, "dynamic_sl")
             sstate["halt_until_day_key_et"] = dkey
             trigger_cooldown(sstate, loss_cooldown_days)
 
