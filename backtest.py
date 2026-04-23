@@ -1,19 +1,19 @@
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Optional, Dict, Any, List
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
-import matplotlib.pyplot as plt
+import yfinance as yf  # type: ignore[import-untyped]
+import matplotlib.pyplot as plt  # type: ignore[import-untyped]
 
 
 # -----------------------------
 # Data helpers
 # -----------------------------
 def _normalize_ohlc_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
+    if df.empty:
         raise RuntimeError("No data returned (empty DataFrame).")
 
     cols = df.columns
@@ -27,7 +27,7 @@ def _normalize_ohlc_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
-    rename = {}
+    rename: dict[str, str] = {}
     for c in df.columns:
         lc = c.lower().replace("_", " ").strip()
         if lc == "open":
@@ -50,12 +50,12 @@ def _normalize_ohlc_columns(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise RuntimeError(f"Missing OHLC columns {missing}. Got columns: {list(df.columns)}")
 
-    return df[needed].dropna().copy()
+    return pd.DataFrame(df[needed].dropna().copy())
 
 
 def fetch_ohlc(symbol: str, start: str, end: str, debug: bool = False) -> pd.DataFrame:
     t = yf.Ticker(symbol)
-    df = t.history(start=start, end=end, auto_adjust=False)
+    df = t.history(start=start, end=end, auto_adjust=False)  # type: ignore[misc]
     df = _normalize_ohlc_columns(df)
 
     if debug:
@@ -67,7 +67,7 @@ def fetch_ohlc(symbol: str, start: str, end: str, debug: bool = False) -> pd.Dat
 
 
 def fetch_close_prices(symbols: List[str], start: str, end: str, debug: bool = False) -> pd.DataFrame:
-    df = yf.download(
+    df = yf.download(  # type: ignore[misc]
         symbols,
         start=start,
         end=end,
@@ -87,10 +87,11 @@ def fetch_close_prices(symbols: List[str], start: str, end: str, debug: bool = F
     else:
         if "Close" not in df.columns:
             raise RuntimeError(f"Missing Close column. Got columns: {list(df.columns)}")
-        close = df[["Close"]].copy()
-        close.columns = [symbols[0]]
+        close = pd.DataFrame(df[["Close"]].copy())
+        close.columns = pd.Index([symbols[0]])
 
-    close.columns = [str(c).upper().strip() for c in close.columns]
+    close = pd.DataFrame(close)
+    close.columns = pd.Index([str(c).upper().strip() for c in close.columns])
     close = close.dropna(how="all")
 
     missing = [s for s in [x.upper() for x in symbols] if s not in close.columns]
@@ -104,7 +105,7 @@ def fetch_close_prices(symbols: List[str], start: str, end: str, debug: bool = F
             f"[DEBUG] close prices rows={len(close)} cols={list(close.columns)} "
             f"first_date={close.index.min().date()} last_date={close.index.max().date()}"
         )
-    return close
+    return pd.DataFrame(close)
 
 
 # -----------------------------
@@ -191,15 +192,15 @@ def backtest_tp_sl(
     entry_price: Optional[float] = None
     entry_i: Optional[int] = None
 
-    equity: List[float] = []
-    trade_rows: List[Dict[str, Any]] = []
+    equity: list[float] = []
+    trade_rows: list[dict[str, Any]] = []
 
     for i in range(len(idx)):
         cur_date = idx[i].date()
         mtm = cash + shares * c[i]
         equity.append(mtm)
 
-        days_left = days_until_withdraw(withdraw_date, cur_date)
+        days_left: Optional[int] = days_until_withdraw(withdraw_date, cur_date)
         cap = _max_exposure(
             days_left,
             early=max_exposure_early,
@@ -254,8 +255,8 @@ def backtest_tp_sl(
         tp_price = entry_price * (1.0 + tp)
         sl_price = entry_price * (1.0 - sl)
 
-        hit_tp = h[i] >= tp_price
-        hit_sl = l[i] <= sl_price
+        hit_tp = float(h[i]) >= tp_price
+        hit_sl = float(l[i]) <= sl_price
 
         if hit_tp or hit_sl:
             # conservative: if both hit, assume SL first
@@ -342,8 +343,8 @@ def backtest_cash_safe_spy(
     shares = 0.0
     avg_cost = 0.0
 
-    equity_curve: List[float] = []
-    trades: List[Dict[str, Any]] = []
+    equity_curve: list[float] = []
+    trades: list[dict[str, Any]] = []
 
     equity_peak = float(start_cash)
     halt_next_day = False
@@ -358,7 +359,7 @@ def backtest_cash_safe_spy(
             halt_next_day = False
             continue
 
-        days_left = (withdraw_date - dt).days if withdraw_date is not None else None
+        days_left: Optional[int] = int((withdraw_date - dt).days) if withdraw_date is not None else None
         max_exp = _max_exposure(days_left, max_exposure_early, max_exposure_mid, max_exposure_late, lockdown_days)
 
         # lockdown => liquidate at open
@@ -375,8 +376,8 @@ def backtest_cash_safe_spy(
             tp_price = avg_cost * (1.0 + tp)
             sl_price = avg_cost * (1.0 - sl)
 
-            hit_tp = h[i] >= tp_price
-            hit_sl = l[i] <= sl_price
+            hit_tp = float(h[i]) >= tp_price
+            hit_sl = float(l[i]) <= sl_price
 
             if hit_tp or hit_sl:
                 if hit_sl:
@@ -509,31 +510,31 @@ def backtest_rotator(
     daily_ret = daily_ret.loc[holding.index]
     vol = vol.loc[holding.index]
 
-    weights = []
+    weights: list[float] = []
     for dt in holding.index:
         sym = holding.loc[dt]
         if sym == "CASH":
             weights.append(0.0)
             continue
         v = vol.loc[dt, sym]
-        if pd.isna(v) or v <= 0:
+        if pd.isna(v) or float(v) <= 0:  # type: ignore[arg-type]
             weights.append(0.0)
             continue
-        w = vol_target_annual / float(v)
+        w = vol_target_annual / float(v)  # type: ignore[arg-type]
         weights.append(clamp(w, 0.0, max_weight))
 
-    weight_s = pd.Series(weights, index=holding.index, name="weight")
+    weight_s = pd.Series(list(weights), index=holding.index, name="weight")
 
-    strat_ret = []
+    strat_ret_list: list[float] = []
     for dt in holding.index:
         sym = holding.loc[dt]
-        w = float(weight_s.loc[dt])
+        w = float(weight_s.loc[dt])  # type: ignore[arg-type]
         if sym == "CASH" or w <= 0.0:
-            strat_ret.append(0.0)
+            strat_ret_list.append(0.0)
         else:
-            strat_ret.append(w * float(daily_ret.loc[dt, sym]))
+            strat_ret_list.append(w * float(daily_ret.loc[dt, sym]))  # type: ignore[arg-type]
 
-    strat_ret = pd.Series(strat_ret, index=holding.index, name="strategy_return")
+    strat_ret: pd.Series[float] = pd.Series(strat_ret_list, index=holding.index, name="strategy_return")
 
     total_bps = float(fee_bps) + float(slippage_bps)
     if total_bps > 0:
@@ -571,14 +572,14 @@ def backtest_rotator(
 # Plot
 # -----------------------------
 def plot_equity(equity: pd.Series, title: str) -> None:
-    plt.figure()
-    plt.plot(equity.index, equity.values)
-    plt.title(title)
-    plt.xlabel("Date")
-    plt.ylabel("Equity ($)")
-    plt.xticks(rotation=30, ha="right")
-    plt.tight_layout()
-    plt.show()
+    plt.figure()  # type: ignore[misc]
+    plt.plot(equity.index, equity.to_numpy())  # type: ignore[misc]
+    plt.title(title)  # type: ignore[misc]
+    plt.xlabel("Date")  # type: ignore[misc]
+    plt.ylabel("Equity ($)")  # type: ignore[misc]
+    plt.xticks(rotation=30, ha="right")  # type: ignore[misc]
+    plt.tight_layout()  # type: ignore[misc]
+    plt.show()  # type: ignore[misc]
 
 
 # -----------------------------
@@ -622,7 +623,7 @@ def main() -> None:
     p.add_argument("--max_weight", type=float, default=1.0)
 
     args = p.parse_args()
-    end = args.end or pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    end = args.end or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     mode = args.mode
 

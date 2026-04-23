@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import os
 import requests
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Optional, Any
 
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -27,7 +27,7 @@ COLOR_PURPLE  = 0xbf5fff   # regime / neutral
 COLOR_GREY    = 0x888888   # unknown
 
 
-def _send(payload: dict) -> None:
+def _send(payload: dict[str, Any]) -> None:
     """Send a webhook payload. Never crashes the bot."""
     if not DISCORD_WEBHOOK_URL:
         return
@@ -46,14 +46,14 @@ def _embed(
     title: str,
     description: str,
     color: int,
-    fields: Optional[list] = None,
+    fields: Optional[list[dict[str, Any]]] = None,
     footer: Optional[str] = None,
-) -> dict:
-    embed: dict = {
+) -> dict[str, Any]:
+    embed: dict[str, Any] = {
         "title": title,
         "description": description,
         "color": color,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     if fields:
         embed["fields"] = fields
@@ -71,7 +71,7 @@ def notify_buy(
     signal_type: str,
     confidence: float,
 ) -> None:
-    payload = _embed(
+    payload: dict[str, Any] = _embed(
         title=f"📈 BUY — {symbol}",
         description=f"New position opened via **{signal_type}** signal",
         color=COLOR_GREEN,
@@ -100,7 +100,7 @@ def notify_sell(
     pnl_str = f"{'+' if win else ''}{pnl_pct*100:.2f}%" if pnl_pct is not None else "—"
     pnl_usd_str = f"${pnl_usd:.2f}" if pnl_usd is not None else "—"
 
-    payload = _embed(
+    payload: dict[str, Any] = _embed(
         title=f"{emoji} SELL — {symbol}",
         description=f"Position closed via **{strategy}**",
         color=color,
@@ -117,7 +117,7 @@ def notify_sell(
 
 
 def notify_run_start(
-    symbols: list,
+    symbols: list[str],
     regime: Optional[str],
     equity: float,
     buying_power: float,
@@ -125,7 +125,7 @@ def notify_run_start(
     regime_str = (regime or "unknown").upper()
     regime_emoji = "🟢" if regime == "bull" else "🔴" if regime == "bear" else "⚪"
 
-    payload = _embed(
+    payload: dict[str, Any] = _embed(
         title="🤖 Bot Cycle Started",
         description=f"Regime: {regime_emoji} **{regime_str}**",
         color=COLOR_BLUE,
@@ -148,7 +148,7 @@ def notify_run_end(
     color = COLOR_GREEN if status == "success" else COLOR_YELLOW if status == "warning" else COLOR_RED
     emoji = "✅" if status == "success" else "⚠️" if status == "warning" else "❌"
 
-    payload = _embed(
+    payload: dict[str, Any] = _embed(
         title=f"{emoji} Bot Cycle Complete",
         description=f"Status: **{status.upper()}**",
         color=color,
@@ -174,7 +174,7 @@ def notify_error(
     if symbol:
         desc = f"**{symbol}** — {desc}"
 
-    payload = _embed(
+    payload: dict[str, Any] = _embed(
         title=f"{emoji} Error — {stage}",
         description=desc,
         color=color,
@@ -196,7 +196,7 @@ def notify_regime_change(
     color = COLOR_GREEN if new_regime == "bull" else COLOR_RED if new_regime == "bear" else COLOR_GREY
     emoji = "🟢" if new_regime == "bull" else "🔴" if new_regime == "bear" else "⚪"
 
-    payload = _embed(
+    payload: dict[str, Any] = _embed(
         title=f"{emoji} Regime Change",
         description=f"Market regime shifted: **{(old_regime or 'unknown').upper()}** → **{(new_regime or 'unknown').upper()}**",
         color=color,

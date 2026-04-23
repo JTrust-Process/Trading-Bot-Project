@@ -1,6 +1,7 @@
 import uuid
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional, Any, Callable
 from supabase import create_client
 import os
 
@@ -35,7 +36,7 @@ class Monitor:
 
     def start_run(self):
         self.run_id = str(uuid.uuid4())
-        self.start_time = datetime.utcnow()
+        self.start_time = datetime.now(timezone.utc)
         try:
             sb = self._sb()
             if sb:
@@ -50,7 +51,7 @@ class Monitor:
         return self.run_id
 
     def end_run(self, status: str = "success"):
-        end_time = datetime.utcnow()
+        end_time = datetime.now(timezone.utc)
         duration_ms = int((end_time - self.start_time).total_seconds() * 1000) if self.start_time else 0
         if self.critical_error:
             status = "failed"
@@ -70,14 +71,14 @@ class Monitor:
             print(f"[MONITOR] end_run failed: {e}")
         self.log_event("BOT_END", metadata={"status": status, "trades": self.trade_count, "errors": self.error_count})
 
-    def log_event(self, event_type: str, symbol: str = None, metadata: dict = None):
+    def log_event(self, event_type: str, symbol: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> None:
         try:
             sb = self._sb()
             if sb and self.run_id:
                 sb.table("bot_events").insert({
                     "id": str(uuid.uuid4()),
                     "run_id": self.run_id,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "event_type": event_type,
                     "symbol": symbol,
                     "metadata": metadata,
@@ -85,7 +86,7 @@ class Monitor:
         except Exception as e:
             print(f"[MONITOR] log_event failed: {e}")
 
-    def log_error(self, stage: str, error: Exception, symbol: str = None, severity: str = "warning", retry_count: int = 0):
+    def log_error(self, stage: str, error: Exception, symbol: Optional[str] = None, severity: str = "warning", retry_count: int = 0) -> None:
         self.error_count += 1
         if severity == "critical":
             self.critical_error = True
@@ -95,7 +96,7 @@ class Monitor:
                 sb.table("bot_errors").insert({
                     "id": str(uuid.uuid4()),
                     "run_id": self.run_id,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "stage": stage,
                     "symbol": symbol,
                     "error_type": type(error).__name__,
@@ -106,7 +107,7 @@ class Monitor:
         except Exception as e:
             print(f"[MONITOR] log_error failed: {e}")
 
-    def safe_execute(self, stage: str, func, *args, symbol: str = None, retries: int = 3, **kwargs):
+    def safe_execute(self, stage: str, func: Callable[..., Any], *args: Any, symbol: Optional[str] = None, retries: int = 3, **kwargs: Any) -> Any:
         for attempt in range(retries):
             try:
                 return func(*args, **kwargs)

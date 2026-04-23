@@ -13,8 +13,6 @@ import os
 from typing import Optional
 from dataclasses import dataclass
 
-import pandas as pd
-
 from market_data import get_daily_bars
 
 

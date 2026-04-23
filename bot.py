@@ -5,15 +5,15 @@ import csv
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, date
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, cast
 
 import requests
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from market_data import get_daily_bars
 from strategy import calculate_atr, trend_strength
-from momentum import rank_symbols, get_buy_candidates, should_sell_momentum, MomentumScore
-from breakout import check_breakout, BreakoutResult
+from momentum import rank_symbols, should_sell_momentum
+from breakout import check_breakout
 from supabase import create_client
 from monitor import monitor
 from notify import (
@@ -139,7 +139,7 @@ def parse_symbols_env(key: str = "SYMBOLS", default: str = "SPY") -> List[str]:
         return []
     syms = [s.strip().upper() for s in raw.split(",") if s.strip()]
     out: List[str] = []
-    seen: set = set()
+    seen: set[str] = set()
     for s in syms:
         if s not in seen:
             out.append(s)
@@ -289,7 +289,7 @@ def load_state() -> Dict[str, Any]:
         return {"symbols": {}}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
+            data: Dict[str, Any] = json.load(f) or {}
         if "symbols" not in data or not isinstance(data["symbols"], dict):
             data["symbols"] = {}
         return data
@@ -325,7 +325,7 @@ def should_halt_symbol(sstate: Dict[str, Any]) -> bool:
     if cooldown:
         try:
             until_dt = datetime.fromisoformat(cooldown).replace(tzinfo=None)
-            if datetime.utcnow() < until_dt:
+            if datetime.now(timezone.utc).replace(tzinfo=None) < until_dt:
                 return True
         except Exception:
             pass
@@ -334,7 +334,7 @@ def should_halt_symbol(sstate: Dict[str, Any]) -> bool:
 
 def trigger_cooldown(sstate: Dict[str, Any], cooldown_days: int) -> None:
     """Put a symbol into multi-day cooldown after a loss (from risk.py)."""
-    until = utcnow().replace(tzinfo=None) + timedelta(days=cooldown_days)
+    until = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=cooldown_days)
     sstate["cooldown_until"] = until.isoformat()
 
 
@@ -426,10 +426,10 @@ class PublicClient:
             return self._account_id
         resp = requests.get(ACCOUNT_URL, headers=self.auth.auth_headers(), timeout=30)
         resp.raise_for_status()
-        accounts = resp.json().get("accounts") or []
+        accounts: list[dict[str, Any]] = resp.json().get("accounts") or []
         if not accounts:
             raise RuntimeError("No accounts returned from Public.")
-        self._account_id = accounts[0]["accountId"]
+        self._account_id = str(accounts[0]["accountId"])
         append_log(self.log_file, "ACCOUNT_LOADED", details="accountId loaded.")
         print_status("ACCOUNT_LOADED")
         return self._account_id
@@ -466,7 +466,7 @@ class PublicClient:
         account_id = self.get_account_id()
         order_id = self.deterministic_order_id(account_id, "BUY", symbol)
         notional = round(quantity * price, 2) if price > 0 else round(quantity, 2)
-        payload = {
+        payload: Dict[str, Any] = {
             "orderId": order_id,
             "instrument": {"symbol": symbol, "type": "EQUITY"},
             "orderSide": "BUY",
@@ -490,7 +490,7 @@ class PublicClient:
             raise ValueError("quantity must be > 0")
         account_id = self.get_account_id()
         order_id = self.deterministic_order_id(account_id, "SELL", symbol)
-        payload = {
+        payload: Dict[str, Any] = {
             "orderId": order_id,
             "instrument": {"symbol": symbol, "type": "EQUITY"},
             "orderSide": "SELL",
@@ -537,10 +537,11 @@ def get_market_regime() -> Optional[str]:
 
 
 def find_equity_position(portfolio: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
-    for p in (portfolio.get("positions") or []):
-        inst = p.get("instrument") or {}
-        if inst.get("type") == "EQUITY" and (inst.get("symbol") or "").upper() == symbol.upper():
-            return p
+    positions: list[Dict[str, Any]] = cast(list[Dict[str, Any]], portfolio.get("positions") or [])
+    for p_typed in positions:
+        inst: Dict[str, Any] = cast(Dict[str, Any], p_typed.get("instrument") or {})
+        if inst.get("type") == "EQUITY" and str(inst.get("symbol") or "").upper() == symbol.upper():
+            return p_typed
     return None
 
 
@@ -549,7 +550,7 @@ def count_open_positions(portfolio: Dict[str, Any], symbols: List[str]) -> int:
 
 
 def get_buying_power_usd(portfolio: Dict[str, Any]) -> float:
-    bp = portfolio.get("buyingPower") or {}
+    bp: Dict[str, Any] = portfolio.get("buyingPower") or {}
     for key in ("cashOnlyBuyingPower", "buyingPower", "availableBuyingPower"):
         v = bp.get(key)
         if v is not None:
@@ -562,9 +563,10 @@ def get_buying_power_usd(portfolio: Dict[str, Any]) -> float:
 
 def get_total_equity_usd(portfolio: Dict[str, Any]) -> float:
     total = 0.0
-    for item in (portfolio.get("equity") or []):
+    equity_items: list[Dict[str, Any]] = cast(list[Dict[str, Any]], portfolio.get("equity") or [])
+    for item_d in equity_items:
         try:
-            total += float(item.get("value", 0.0) or 0.0)
+            total += float(item_d.get("value", 0.0) or 0.0)
         except Exception:
             pass
     return float(total)
@@ -590,16 +592,16 @@ def get_position_value_usd(pos: Dict[str, Any]) -> float:
             pass
     try:
         qty = float(pos.get("quantity", 0.0) or 0.0)
-        lp = pos.get("lastPrice") or {}
-        px = float(lp.get("lastPrice", 0.0) or 0.0)
+        lp2: Dict[str, Any] = pos.get("lastPrice") or {}
+        px = float(lp2.get("lastPrice", 0.0) or 0.0)
         return qty * px
     except Exception:
         return 0.0
 
 
 def get_unrealized_pnl_pct(pos: Dict[str, Any]) -> Optional[float]:
-    ig = pos.get("instrumentGain") or {}
-    gp = ig.get("gainPercentage")
+    ig: Dict[str, Any] = pos.get("instrumentGain") or {}
+    gp: Optional[Any] = ig.get("gainPercentage")
     if gp is None:
         return None
     try:
@@ -609,8 +611,8 @@ def get_unrealized_pnl_pct(pos: Dict[str, Any]) -> Optional[float]:
 
 
 def get_unrealized_pnl_usd(pos: Dict[str, Any]) -> Optional[float]:
-    ig = pos.get("instrumentGain") or {}
-    v = ig.get("gain")
+    ig: Dict[str, Any] = pos.get("instrumentGain") or {}
+    v: Optional[Any] = ig.get("gain")
     if v is None:
         return None
     try:
@@ -620,8 +622,8 @@ def get_unrealized_pnl_usd(pos: Dict[str, Any]) -> Optional[float]:
 
 
 def get_last_price(pos: Dict[str, Any]) -> Optional[float]:
-    lp = pos.get("lastPrice") or {}
-    v = lp.get("lastPrice")
+    lp: Dict[str, Any] = pos.get("lastPrice") or {}
+    v: Optional[Any] = lp.get("lastPrice")
     if v is None:
         return None
     try:
@@ -770,7 +772,7 @@ def run_live_cycle(
     all_managed = list(dict.fromkeys(symbols + scan_symbols))
 
     # Build snapshots of currently held positions
-    snapshots = []
+    snapshots: list[dict[str, Any]] = []
     total_pos_value = 0.0
     snapshot_symbols = all_managed if manage_all_positions else symbols
 
@@ -1008,7 +1010,7 @@ def run_live_cycle(
         atr = calculate_atr(df, atr_period)
         price = float(df["close"].iloc[-1])
 
-        if not price or atr is None or atr / price < atr_vol_threshold:
+        if not price or not atr or atr / price < atr_vol_threshold:
             continue
 
         strength = trend_strength(df, trend_fast, trend_slow)
@@ -1090,9 +1092,9 @@ def run_live_cycle(
     # ENTRY LOGIC
     # ----------------------------------------------------------
     open_positions = count_open_positions(portfolio, all_managed)
-    _exp_str = f"{total_exposure:.2%}" if total_exposure is not None else "None"
-    _cap_str = f"{cap_total:.2%}" if cap_total is not None else "None"
-    _bp_str  = f"{buying_power:.2f}" if buying_power is not None else "None"
+    _exp_str = f"{total_exposure:.2%}"
+    _cap_str = f"{cap_total:.2%}"
+    _bp_str  = f"{buying_power:.2f}"
     append_log(log_file, "ENTRY_SCAN", details=f"trades_today={trades_today} regime={regime} exposure={_exp_str} cap={_cap_str} bp={_bp_str} open={open_positions}/{max_open_positions}")
 
     # Keep a $25 buffer to avoid margin calls (maintenance requirement cushion)
@@ -1170,7 +1172,7 @@ def run_live_cycle(
             atr = calculate_atr(df, atr_period)
             price = float(df["close"].iloc[-1])
 
-            if price <= 0 or atr is None:
+            if price <= 0 or not atr:
                 append_log(log_file, "SKIP", symbol=sym, details="invalid price or ATR")
                 continue
 
