@@ -1106,21 +1106,21 @@ def run_live_cycle(
             else:
                 continue
 
+        # Use cached bars for ATR/trend — avoids extra API call during exit loop
+        # If not cached, fall back to base TP/SL (still correct, just not scaled)
         df = get_daily_bars(sym)
-        if df is None or len(df) < trend_slow + 5:
-            continue
+        if df is not None and len(df) >= trend_slow + 5:
+            atr = calculate_atr(df, atr_period)
+            price_for_atr = float(df["close"].iloc[-1])
+            if price_for_atr and atr and atr / price_for_atr >= atr_vol_threshold:
+                strength = trend_strength(df, trend_fast, trend_slow)
+                scale = min(1 + (strength / trend_strong_threshold), max_position_scale)
+                dynamic_tp = take_profit_base * (1 + 0.5 * min(scale - 1, 1.5))
+            else:
+                dynamic_tp = take_profit_base
+        else:
+            dynamic_tp = take_profit_base
 
-        atr = calculate_atr(df, atr_period)
-        price = float(df["close"].iloc[-1])
-
-        if not price or not atr or atr / price < atr_vol_threshold:
-            continue
-
-        strength = trend_strength(df, trend_fast, trend_slow)
-
-        # Scale TP based on trend strength (from risk.py dynamic_take_profit)
-        scale = min(1 + (strength / trend_strong_threshold), max_position_scale)
-        dynamic_tp = take_profit_base * (1 + 0.5 * min(scale - 1, 1.5))
         dynamic_sl = stop_loss_base * (0.8 if regime == "bear" else 1.0)
 
         # Add fee buffer so we only TP if gain meaningfully exceeds fees
