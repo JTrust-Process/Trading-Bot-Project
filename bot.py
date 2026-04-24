@@ -1040,6 +1040,7 @@ def run_live_cycle(
                 monitor.log_error("place_sell_daily_loss", sell_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
+            monitor.trade_count += 1
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=entry_price, exit_price=current_price,
@@ -1068,6 +1069,7 @@ def run_live_cycle(
                 monitor.log_error("place_sell_max_drawdown", sell_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
+            monitor.trade_count += 1
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=entry_price, exit_price=current_price,
@@ -1168,6 +1170,7 @@ def run_live_cycle(
                 monitor.log_error("place_sell_sl", sell_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
+            monitor.trade_count += 1
             true_entry = sstate.get("entry_price") or entry_price
             true_amount = sstate.get("entry_amount") or pos_value
             true_pnl_pct = ((current_price - true_entry) / true_entry) if (true_entry and current_price and true_entry > 0) else pnl_pct
@@ -1339,6 +1342,7 @@ def run_live_cycle(
             open_positions += 1
             total_pos_value += alloc_value
             total_exposure = total_pos_value / total_equity
+            monitor.trade_count += 1
 
             # Store entry price and date in state for accurate PnL tracking and hold period
             sstate = sym_state(state, sym)
