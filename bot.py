@@ -281,6 +281,77 @@ def log_trade(
         print_status("SUPABASE_ERROR", str(e))
 
 
+
+# -----------------------------
+# Supabase positions tracking
+# -----------------------------
+def upsert_open_position(
+    symbol: str,
+    entry_price: float,
+    entry_date: str,
+    quantity: float,
+    amount_usd: float,
+    strategy: str,
+) -> None:
+    """Insert or update an open position in Supabase. Never crashes the bot."""
+    global supabase
+    if supabase is None:
+        return
+    try:
+        supabase.table("positions").upsert({
+            "symbol": symbol,
+            "entry_price": entry_price,
+            "entry_date": entry_date,
+            "quantity": quantity,
+            "amount_usd": amount_usd,
+            "strategy": strategy,
+            "status": "open",
+            "updated_at": utcnow().isoformat(),
+        }, on_conflict="symbol").execute()
+    except Exception as e:
+        print_status("POSITIONS_ERROR", f"upsert failed for {symbol}: {e}")
+
+
+def get_open_position(symbol: str) -> Optional[Dict[str, Any]]:
+    """Fetch open position record from Supabase. Returns None if not found."""
+    global supabase
+    if supabase is None:
+        return None
+    try:
+        result = supabase.table("positions").select("*").eq("symbol", symbol).eq("status", "open").execute()
+        if result.data and len(result.data) > 0:
+            return cast(Dict[str, Any], result.data[0])
+        return None
+    except Exception as e:
+        print_status("POSITIONS_ERROR", f"get failed for {symbol}: {e}")
+        return None
+
+
+def close_position(
+    symbol: str,
+    exit_price: float,
+    pnl_pct: Optional[float],
+    pnl_usd: Optional[float],
+    reason: str,
+) -> None:
+    """Mark a position as closed in Supabase. Never crashes the bot."""
+    global supabase
+    if supabase is None:
+        return
+    try:
+        supabase.table("positions").update({
+            "status": "closed",
+            "exit_price": exit_price,
+            "exit_date": today_key_et(),
+            "pnl_pct": round(pnl_pct * 100, 4) if pnl_pct is not None else None,
+            "pnl_usd": pnl_usd,
+            "close_reason": reason,
+            "updated_at": utcnow().isoformat(),
+        }).eq("symbol", symbol).eq("status", "open").execute()
+    except Exception as e:
+        print_status("POSITIONS_ERROR", f"close failed for {symbol}: {e}")
+
+
 # -----------------------------
 # State (per-symbol) — consolidated from risk.py
 # -----------------------------
@@ -939,6 +1010,7 @@ def run_live_cycle(
             )
             print_status("SELL_SUBMITTED", f"{sym} MOMENTUM_EXIT pnl={true_pnl_pct or 0:.2%}")
             notify_sell(sym, current_price or 0, true_pnl_pct, true_pnl_usd, true_amount, "momentum_exit")
+            close_position(sym, float(current_price or 0), true_pnl_pct, true_pnl_usd, "momentum_exit")
             sstate["halt_until_day_key_et"] = dkey
             continue
 
@@ -1017,12 +1089,20 @@ def run_live_cycle(
 
         # Dynamic TP / SL
         # If Public API doesn't return gainPercentage, calculate from stored entry_price
+        # Fall back to Supabase positions table if not in local state (survives runner restarts)
         if pnl_pct is None:
             stored_entry = sstate.get("entry_price")
+            if not stored_entry:
+                pos_record = get_open_position(sym)
+                if pos_record:
+                    stored_entry = pos_record.get("entry_price")
+                    if stored_entry:
+                        sstate["entry_price"] = float(stored_entry)
+                        sstate["entry_date"] = str(pos_record.get("entry_date") or "")
             if stored_entry and current_price and float(stored_entry) > 0:
                 pnl_pct = (float(current_price) - float(stored_entry)) / float(stored_entry)
                 append_log(log_file, "SYMBOL_STATE", symbol=sym,
-                    details=f"pnl_pct calculated from state: entry={stored_entry:.2f} last={current_price:.2f} pnl={pnl_pct:.2%}")
+                    details=f"pnl_pct from entry_price: entry={float(stored_entry):.2f} last={current_price:.2f} pnl={pnl_pct:.2%}")
             else:
                 continue
 
@@ -1077,6 +1157,7 @@ def run_live_cycle(
             )
             print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_TP pnl={true_pnl_pct or 0:.2%}")
             notify_sell(sym, current_price or 0, true_pnl_pct, true_pnl_usd, true_amount, "dynamic_tp")
+            close_position(sym, float(current_price or 0), true_pnl_pct, true_pnl_usd, "dynamic_tp")
             sstate["halt_until_day_key_et"] = dkey
 
         elif pnl_pct <= -dynamic_sl:
@@ -1110,6 +1191,7 @@ def run_live_cycle(
             )
             print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_SL pnl={true_pnl_pct or 0:.2%}")
             notify_sell(sym, current_price or 0, true_pnl_pct, true_pnl_usd, true_amount, "dynamic_sl")
+            close_position(sym, float(current_price or 0), true_pnl_pct, true_pnl_usd, "dynamic_sl")
             sstate["halt_until_day_key_et"] = dkey
             trigger_cooldown(sstate, loss_cooldown_days)
 
@@ -1263,6 +1345,7 @@ def run_live_cycle(
             sstate["entry_price"] = price
             sstate["entry_amount"] = alloc_value
             sstate["entry_date"] = today_key_et()
+            upsert_open_position(sym, price, today_key_et(), qty, alloc_value, signal_type)
 
             log_trade(
                 symbol=sym, side="BUY",
