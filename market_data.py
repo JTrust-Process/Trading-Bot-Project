@@ -1,11 +1,11 @@
 """
-market_data.py — Daily OHLCV bars via Alpha Vantage free API.
+market_data.py — Daily OHLCV bars via Polygon.io free tier.
 
-Free tier: 25 requests/day, 1 req/sec burst limit.
-Uses in-memory cache so each symbol is only fetched once per bot run,
-keeping total API calls well within the 25/day limit.
+Free tier: unlimited daily calls, 5 calls/minute.
+Requires POLYGON_API_KEY environment variable.
+Sign up free at: https://polygon.io/
 
-Sign up free at: https://www.alphavantage.co/support/#api-key
+In-memory cache so each symbol is only fetched once per bot run.
 """
 
 import os
@@ -13,32 +13,32 @@ import time
 import requests
 import pandas as pd
 from typing import Optional, Any
+from datetime import datetime, timedelta
 
 _session = requests.Session()
-_AV_BASE = "https://www.alphavantage.co/query"
+_POLYGON_BASE = "https://api.polygon.io/v2/aggs/ticker"
 _last_call_time = 0.0
 
 # In-memory cache: symbol -> (timestamp, DataFrame)
-# Cached for 1 hour so a single bot run reuses data across all callers
 _cache: dict[str, tuple[float, pd.DataFrame]] = {}
-_CACHE_TTL = 3600  # seconds
+_CACHE_TTL = 3600  # 1 hour
 
 
-def _throttle():
-    """Enforce 1.2s between API calls (free tier: 1 req/sec)."""
+def _throttle() -> None:
+    """Enforce 12 seconds between calls to stay under 5/min free tier limit."""
     global _last_call_time
     elapsed = time.time() - _last_call_time
-    if elapsed < 1.2:
-        time.sleep(1.2 - elapsed)
+    if elapsed < 12.0:
+        time.sleep(12.0 - elapsed)
     _last_call_time = time.time()
 
 
 def get_daily_bars(symbol: str, outputsize: int = 100) -> Optional[pd.DataFrame]:
     """
-    Fetch daily OHLCV bars from Alpha Vantage with in-memory caching.
+    Fetch daily OHLCV bars from Polygon.io.
 
     Returns a DataFrame with columns: open, high, low, close, volume
-    sorted oldest → newest (up to 100 bars on free tier), or None on failure.
+    sorted oldest → newest, or None on failure.
     """
     symbol = symbol.upper()
 
@@ -48,20 +48,23 @@ def get_daily_bars(symbol: str, outputsize: int = 100) -> Optional[pd.DataFrame]
         cached_time: float = cache_entry[0]
         cached_df: pd.DataFrame = cache_entry[1]
         if time.time() - cached_time < _CACHE_TTL:
-            actual = min(outputsize, len(cached_df))
-            return cached_df.tail(actual).reset_index(drop=True)
+            return cached_df.tail(min(outputsize, len(cached_df))).reset_index(drop=True)
 
-    api_key = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+    api_key = os.getenv("POLYGON_API_KEY", "")
     if not api_key:
-        print(f"[market_data] ERROR: ALPHA_VANTAGE_API_KEY not set")
+        print(f"[market_data] ERROR: POLYGON_API_KEY not set")
         return None
 
+    # Fetch last 200 trading days (~10 months) to cover 50-day SMA + momentum
+    end_date = datetime.utcnow().strftime("%Y-%m-%d")
+    start_date = (datetime.utcnow() - timedelta(days=300)).strftime("%Y-%m-%d")
+
+    url = f"{_POLYGON_BASE}/{symbol}/range/1/day/{start_date}/{end_date}"
     params = {
-        "function": "TIME_SERIES_DAILY",
-        "symbol": symbol,
-        "outputsize": "compact",  # 100 bars — free tier only
-        "apikey": api_key,
-        "datatype": "json",
+        "adjusted": "true",
+        "sort": "asc",
+        "limit": 200,
+        "apiKey": api_key,
     }
 
     max_retries = 3
@@ -70,7 +73,16 @@ def get_daily_bars(symbol: str, outputsize: int = 100) -> Optional[pd.DataFrame]
     for attempt in range(max_retries):
         try:
             _throttle()
-            resp = _session.get(_AV_BASE, params=params, timeout=30)
+            resp = _session.get(url, params=params, timeout=30)
+
+            if resp.status_code == 429:
+                print(f"[market_data] Polygon rate limit for {symbol}, waiting 60s...")
+                time.sleep(60)
+                continue
+
+            if resp.status_code == 403:
+                print(f"[market_data] Polygon auth error — check POLYGON_API_KEY")
+                return None
 
             if resp.status_code != 200:
                 if attempt < max_retries - 1:
@@ -78,41 +90,34 @@ def get_daily_bars(symbol: str, outputsize: int = 100) -> Optional[pd.DataFrame]
                     continue
                 return None
 
-            data = resp.json()
+            data: dict[str, Any] = resp.json()
 
-            if "Error Message" in data:
-                print(f"[market_data] AV error for {symbol}: {data['Error Message']}")
+            if data.get("status") == "ERROR":
+                print(f"[market_data] Polygon error for {symbol}: {data.get('error')}")
                 return None
 
-            if "Note" in data or "Information" in data:
-                print(f"[market_data] AV rate limit for {symbol}, waiting 65s...")
-                time.sleep(65)
-                continue
-
-            ts = data.get("Time Series (Daily)", {})
-            if not ts:
+            results: list[dict[str, Any]] = data.get("results") or []
+            if not results:
                 return None
 
             rows: list[dict[str, Any]] = []
-            for date_str, vals in ts.items():
+            for r in results:
                 rows.append({
-                    "date":   date_str,
-                    "open":   float(vals["1. open"]),
-                    "high":   float(vals["2. high"]),
-                    "low":    float(vals["3. low"]),
-                    "close":  float(vals["4. close"]),
-                    "volume": float(vals["5. volume"]),
+                    "open":   float(r.get("o", 0)),
+                    "high":   float(r.get("h", 0)),
+                    "low":    float(r.get("l", 0)),
+                    "close":  float(r.get("c", 0)),
+                    "volume": float(r.get("v", 0)),
                 })
 
             df = pd.DataFrame(rows)
-            df = df.sort_values("date").reset_index(drop=True)
-            df = df.drop(columns=["date"])
+            df = df.dropna(subset=["close"])
+            df = df[df["close"] > 0].reset_index(drop=True)
 
-            # Store full 100 bars in cache
+            # Store full history in cache
             _cache[symbol] = (time.time(), df)
 
-            actual = min(outputsize, len(df))
-            return df.tail(actual).reset_index(drop=True)
+            return df.tail(min(outputsize, len(df))).reset_index(drop=True)
 
         except requests.exceptions.Timeout:
             if attempt < max_retries - 1:
