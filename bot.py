@@ -1016,8 +1016,15 @@ def run_live_cycle(
             continue
 
         # Dynamic TP / SL
+        # If Public API doesn't return gainPercentage, calculate from stored entry_price
         if pnl_pct is None:
-            continue
+            stored_entry = sstate.get("entry_price")
+            if stored_entry and current_price and float(stored_entry) > 0:
+                pnl_pct = (float(current_price) - float(stored_entry)) / float(stored_entry)
+                append_log(log_file, "SYMBOL_STATE", symbol=sym,
+                    details=f"pnl_pct calculated from state: entry={stored_entry:.2f} last={current_price:.2f} pnl={pnl_pct:.2%}")
+            else:
+                continue
 
         df = get_daily_bars(sym)
         if df is None or len(df) < trend_slow + 5:
