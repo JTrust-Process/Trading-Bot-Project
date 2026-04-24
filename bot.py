@@ -727,6 +727,7 @@ def run_live_cycle(
     momentum_sell_rank: int = 5,
     confidence_min_threshold: float = 0.3,
     breakout_lookback: int = 20,
+    min_hold_days: int = 1,
 ) -> None:
 
     global _last_regime
@@ -888,6 +889,20 @@ def run_live_cycle(
             print_status("SKIP", f"{sym} halted")
             continue
 
+        # Minimum hold period — prevents PDT violations (default 1 = no same-day sells)
+        entry_date_str = str(sstate.get("entry_date") or sstate.get("entry_day") or "")
+        if entry_date_str and min_hold_days > 0:
+            try:
+                entry_dt = datetime.strptime(entry_date_str, "%Y-%m-%d").date()
+                days_held = (today_date_et() - entry_dt).days
+                if days_held < min_hold_days:
+                    append_log(log_file, "SKIP", symbol=sym,
+                        details=f"MIN_HOLD: held {days_held}d < {min_hold_days}d required (entry={entry_date_str})")
+                    print_status("SKIP", f"{sym} MIN_HOLD {days_held}d < {min_hold_days}d")
+                    continue
+            except Exception:
+                pass
+
         # Momentum exit: sell if rank faded or score went negative (only for momentum symbols)
         # Don't momentum_exit at a loss — let stop loss handle it to avoid fee drag
         FEE_BUFFER = 0.005  # 0.5% minimum gain to cover fees before momentum exit
@@ -907,6 +922,7 @@ def run_live_cycle(
             true_pnl_usd = (true_pnl_pct * true_amount) if true_pnl_pct is not None else pnl_usd
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
+            sstate.pop("entry_day", None)
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=true_entry, exit_price=current_price,
@@ -1037,6 +1053,7 @@ def run_live_cycle(
             true_pnl_usd = (true_pnl_pct * true_amount) if true_pnl_pct is not None else pnl_usd
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
+            sstate.pop("entry_day", None)
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=true_entry, exit_price=current_price,
@@ -1069,6 +1086,7 @@ def run_live_cycle(
             true_pnl_usd = (true_pnl_pct * true_amount) if true_pnl_pct is not None else pnl_usd
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
+            sstate.pop("entry_day", None)
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=true_entry, exit_price=current_price,
@@ -1233,10 +1251,11 @@ def run_live_cycle(
             total_pos_value += alloc_value
             total_exposure = total_pos_value / total_equity
 
-            # Store entry price in state for accurate PnL tracking on sell
+            # Store entry price and date in state for accurate PnL tracking and hold period
             sstate = sym_state(state, sym)
             sstate["entry_price"] = price
             sstate["entry_amount"] = alloc_value
+            sstate["entry_date"] = today_key_et()
 
             log_trade(
                 symbol=sym, side="BUY",
@@ -1301,6 +1320,7 @@ def main() -> None:
 
     # Breakout config
     breakout_lookback = get_env_int("BREAKOUT_LOOKBACK", 20)
+    min_hold_days = get_env_int("MIN_HOLD_DAYS", 1)
 
     take_profit_base = get_env_float("TAKE_PROFIT_BASE", 0.04)
     stop_loss_base = get_env_float("STOP_LOSS_BASE", 0.02)
@@ -1384,6 +1404,7 @@ def main() -> None:
                 momentum_sell_rank=momentum_sell_rank,
                 confidence_min_threshold=confidence_min_threshold,
                 breakout_lookback=breakout_lookback,
+                min_hold_days=min_hold_days,
                 max_trades_per_day=max_trades_per_day,
                 max_order_amount_usd=max_order_amount_usd,
                 max_open_positions=max_open_positions,

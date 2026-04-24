@@ -64,6 +64,7 @@ jobs:
           MAX_DRAWDOWN: "0.08"
           DAILY_LOSS_LIMIT: "0.03"
           LOSS_COOLDOWN_DAYS: "3"
+          MIN_HOLD_DAYS: "2"
  
           # ── Exposure cap ───────────────────────────────────────────────────
           MAX_EXPOSURE_EARLY: "0.90"
