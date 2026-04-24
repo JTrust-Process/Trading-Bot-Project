@@ -25,11 +25,11 @@ _CACHE_TTL = 3600  # 1 hour
 
 
 def _throttle() -> None:
-    """Enforce 6 seconds between calls — safe under 5/min (10/min actual limit on free tier)."""
+    """Enforce 13 seconds between calls — stays safely under 5/min Polygon free tier limit."""
     global _last_call_time
     elapsed = time.time() - _last_call_time
-    if elapsed < 6.0:
-        time.sleep(6.0 - elapsed)
+    if elapsed < 13.0:
+        time.sleep(13.0 - elapsed)
     _last_call_time = time.time()
 
 
