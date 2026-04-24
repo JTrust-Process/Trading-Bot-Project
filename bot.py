@@ -219,9 +219,22 @@ def print_status(event: str, details: str = "") -> None:
 
 
 def count_trades_today(log_file: str) -> int:
+    """Count trades placed today. Reads from Supabase so it persists across GHA runs."""
+    global supabase
+    tkey_et = today_key_et()
+    # Try Supabase first (persists across runner restarts)
+    if supabase is not None:
+        try:
+            result = supabase.table("bot_logs").select("id", count="exact").in_(  # type: ignore[call-overload]
+                "event", ["LIVE_BUY_SUBMITTED", "LIVE_SELL_SUBMITTED"]
+            ).gte("timestamp_utc", f"{tkey_et}T00:00:00+00:00").execute()
+            if result.count is not None:
+                return int(result.count)
+        except Exception:
+            pass
+    # Fallback to CSV if Supabase unavailable
     if not os.path.exists(log_file):
         return 0
-    tkey_et = today_key_et()
     n = 0
     with open(log_file, "r", newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
@@ -230,19 +243,8 @@ def count_trades_today(log_file: str) -> int:
             if ev not in ("LIVE_BUY_SUBMITTED", "LIVE_SELL_SUBMITTED"):
                 continue
             ts = (row.get("timestamp_utc", "") or "").strip()
-            if not ts:
-                continue
-            try:
-                ts_norm = ts.replace("Z", "+00:00")
-                dt_utc = datetime.fromisoformat(ts_norm)
-                if dt_utc.tzinfo is None:
-                    dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-                dt_et = dt_utc.astimezone(NY_TZ)
-                if dt_et.strftime("%Y-%m-%d") == tkey_et:
-                    n += 1
-            except Exception:
-                if ts.startswith(tkey_et):
-                    n += 1
+            if ts.startswith(tkey_et):
+                n += 1
     return n
 
 
@@ -298,7 +300,13 @@ def upsert_open_position(
     if supabase is None:
         return
     try:
-        supabase.table("positions").upsert({
+        # Close any existing open position first (handles re-buys)
+        supabase.table("positions").update({
+            "status": "replaced",
+            "updated_at": utcnow().isoformat(),
+        }).eq("symbol", symbol).eq("status", "open").execute()
+        # Insert fresh open position record
+        supabase.table("positions").insert({
             "symbol": symbol,
             "entry_price": entry_price,
             "entry_date": entry_date,
@@ -307,7 +315,7 @@ def upsert_open_position(
             "strategy": strategy,
             "status": "open",
             "updated_at": utcnow().isoformat(),
-        }, on_conflict="symbol").execute()
+        }).execute()
     except Exception as e:
         print_status("POSITIONS_ERROR", f"upsert failed for {symbol}: {e}")
 
@@ -875,12 +883,16 @@ def run_live_cycle(
 
     total_exposure = total_pos_value / total_equity if total_equity > 0 else 0.0
 
-    notify_run_start(
-        symbols=all_managed[:5],
-        regime=regime,
-        equity=total_equity,
-        buying_power=buying_power,
-    )
+    # Only notify run start if there are open positions to manage or it's market open
+    _now_et = datetime.now(NY_TZ)
+    _is_open_bell = _now_et.hour == 9 and _now_et.minute < 45
+    if snapshots or _is_open_bell:
+        notify_run_start(
+            symbols=all_managed[:5],
+            regime=regime,
+            equity=total_equity,
+            buying_power=buying_power,
+        )
 
     append_log(
         log_file, "PORTFOLIO",
@@ -994,6 +1006,7 @@ def run_live_cycle(
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
             sstate.pop("entry_day", None)
+            sstate.pop("entry_date", None)
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=true_entry, exit_price=current_price,
@@ -1143,6 +1156,7 @@ def run_live_cycle(
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
             sstate.pop("entry_day", None)
+            sstate.pop("entry_date", None)
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=true_entry, exit_price=current_price,
@@ -1178,6 +1192,7 @@ def run_live_cycle(
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
             sstate.pop("entry_day", None)
+            sstate.pop("entry_date", None)
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=true_entry, exit_price=current_price,
