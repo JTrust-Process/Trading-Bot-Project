@@ -219,22 +219,9 @@ def print_status(event: str, details: str = "") -> None:
 
 
 def count_trades_today(log_file: str) -> int:
-    """Count trades placed today. Reads from Supabase so it persists across GHA runs."""
-    global supabase
-    tkey_et = today_key_et()
-    # Try Supabase first (persists across runner restarts)
-    if supabase is not None:
-        try:
-            result = supabase.table("bot_logs").select("id", count="exact").in_(  # type: ignore[call-overload]
-                "event", ["LIVE_BUY_SUBMITTED", "LIVE_SELL_SUBMITTED"]
-            ).gte("timestamp_utc", f"{tkey_et}T00:00:00+00:00").execute()
-            if result.count is not None:
-                return int(result.count)
-        except Exception:
-            pass
-    # Fallback to CSV if Supabase unavailable
     if not os.path.exists(log_file):
         return 0
+    tkey_et = today_key_et()
     n = 0
     with open(log_file, "r", newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
@@ -243,8 +230,19 @@ def count_trades_today(log_file: str) -> int:
             if ev not in ("LIVE_BUY_SUBMITTED", "LIVE_SELL_SUBMITTED"):
                 continue
             ts = (row.get("timestamp_utc", "") or "").strip()
-            if ts.startswith(tkey_et):
-                n += 1
+            if not ts:
+                continue
+            try:
+                ts_norm = ts.replace("Z", "+00:00")
+                dt_utc = datetime.fromisoformat(ts_norm)
+                if dt_utc.tzinfo is None:
+                    dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+                dt_et = dt_utc.astimezone(NY_TZ)
+                if dt_et.strftime("%Y-%m-%d") == tkey_et:
+                    n += 1
+            except Exception:
+                if ts.startswith(tkey_et):
+                    n += 1
     return n
 
 
@@ -300,13 +298,7 @@ def upsert_open_position(
     if supabase is None:
         return
     try:
-        # Close any existing open position first (handles re-buys)
-        supabase.table("positions").update({
-            "status": "replaced",
-            "updated_at": utcnow().isoformat(),
-        }).eq("symbol", symbol).eq("status", "open").execute()
-        # Insert fresh open position record
-        supabase.table("positions").insert({
+        supabase.table("positions").upsert({
             "symbol": symbol,
             "entry_price": entry_price,
             "entry_date": entry_date,
@@ -315,7 +307,7 @@ def upsert_open_position(
             "strategy": strategy,
             "status": "open",
             "updated_at": utcnow().isoformat(),
-        }).execute()
+        }, on_conflict="symbol").execute()
     except Exception as e:
         print_status("POSITIONS_ERROR", f"upsert failed for {symbol}: {e}")
 
@@ -563,6 +555,44 @@ class PublicClient:
         )
         resp.raise_for_status()
         return {"orderId": order_id, "response": resp.json()}
+
+    def get_fill_price(self, order_id: str) -> Optional[float]:
+        """
+        Fetch actual fill price for a completed order.
+        Waits up to 5s for the order to settle then reads avgFillPrice.
+        Returns None if unavailable — caller falls back to market price.
+        """
+        account_id = self.get_account_id()
+        url = f"{ORDER_URL_TMPL.format(accountId=account_id)}/{order_id}"
+        for _ in range(3):
+            try:
+                time.sleep(2)
+                resp = requests.get(url, headers=self.auth.auth_headers(), timeout=15)
+                if resp.status_code != 200:
+                    return None
+                data: Dict[str, Any] = resp.json()
+                # Try common field names Public might use
+                for field in ("avgFillPrice", "fillPrice", "averageFillPrice", "price", "filledPrice"):
+                    val = data.get(field)
+                    if val is not None:
+                        try:
+                            return float(val)
+                        except Exception:
+                            pass
+                # Some APIs nest it under order or fill objects
+                for key in ("order", "fill", "execution"):
+                    nested = data.get(key) or {}
+                    for field in ("avgFillPrice", "fillPrice", "price"):
+                        val = nested.get(field)
+                        if val is not None:
+                            try:
+                                return float(val)
+                            except Exception:
+                                pass
+                return None
+            except Exception:
+                return None
+        return None
 
     def place_market_sell_quantity(self, symbol: str, quantity: float) -> Dict[str, Any]:
         if quantity <= 0:
@@ -883,16 +913,12 @@ def run_live_cycle(
 
     total_exposure = total_pos_value / total_equity if total_equity > 0 else 0.0
 
-    # Only notify run start if there are open positions to manage or it's market open
-    _now_et = datetime.now(NY_TZ)
-    _is_open_bell = _now_et.hour == 9 and _now_et.minute < 45
-    if snapshots or _is_open_bell:
-        notify_run_start(
-            symbols=all_managed[:5],
-            regime=regime,
-            equity=total_equity,
-            buying_power=buying_power,
-        )
+    notify_run_start(
+        symbols=all_managed[:5],
+        regime=regime,
+        equity=total_equity,
+        buying_power=buying_power,
+    )
 
     append_log(
         log_file, "PORTFOLIO",
@@ -1006,24 +1032,28 @@ def run_live_cycle(
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
             sstate.pop("entry_day", None)
-            sstate.pop("entry_date", None)
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=true_entry, exit_price=current_price,
                 pnl_pct=true_pnl_pct, pnl_usd=true_pnl_usd,
                 amount_usd=true_amount, strategy="momentum_exit",
             )
+            sell_fill = client.get_fill_price(result["orderId"]) if not client.dry_run else None
+            actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
+            if sell_fill and true_entry and float(true_entry) > 0:
+                true_pnl_pct = (actual_exit - float(true_entry)) / float(true_entry)
+                true_pnl_usd = true_pnl_pct * float(true_amount)
             append_log(
                 log_file, "LIVE_SELL_SUBMITTED",
                 symbol=sym, side="SELL",
                 amount_usd=f"{true_amount:.2f}",
                 order_id=result["orderId"],
                 status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"MOMENTUM_EXIT entry={true_entry or 0:.2f} exit={current_price or 0:.2f} pnl={true_pnl_pct or 0:.2%} qty={qty:.8f}",
+                details=f"MOMENTUM_EXIT entry={true_entry or 0:.2f} exit={actual_exit:.2f} pnl={true_pnl_pct or 0:.2%} qty={qty:.8f} fill={sell_fill or 'N/A'}",
             )
-            print_status("SELL_SUBMITTED", f"{sym} MOMENTUM_EXIT pnl={true_pnl_pct or 0:.2%}")
-            notify_sell(sym, current_price or 0, true_pnl_pct, true_pnl_usd, true_amount, "momentum_exit")
-            close_position(sym, float(current_price or 0), true_pnl_pct, true_pnl_usd, "momentum_exit")
+            print_status("SELL_SUBMITTED", f"{sym} MOMENTUM_EXIT pnl={true_pnl_pct or 0:.2%} fill={actual_exit:.2f}")
+            notify_sell(sym, actual_exit, true_pnl_pct, true_pnl_usd, true_amount, "momentum_exit")
+            close_position(sym, actual_exit, true_pnl_pct, true_pnl_usd, "momentum_exit")
             sstate["halt_until_day_key_et"] = dkey
             continue
 
@@ -1053,7 +1083,6 @@ def run_live_cycle(
                 monitor.log_error("place_sell_daily_loss", sell_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
-            monitor.trade_count += 1
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=entry_price, exit_price=current_price,
@@ -1082,7 +1111,6 @@ def run_live_cycle(
                 monitor.log_error("place_sell_max_drawdown", sell_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
-            monitor.trade_count += 1
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=entry_price, exit_price=current_price,
@@ -1121,21 +1149,21 @@ def run_live_cycle(
             else:
                 continue
 
-        # Use cached bars for ATR/trend — avoids extra API call during exit loop
-        # If not cached, fall back to base TP/SL (still correct, just not scaled)
         df = get_daily_bars(sym)
-        if df is not None and len(df) >= trend_slow + 5:
-            atr = calculate_atr(df, atr_period)
-            price_for_atr = float(df["close"].iloc[-1])
-            if price_for_atr and atr and atr / price_for_atr >= atr_vol_threshold:
-                strength = trend_strength(df, trend_fast, trend_slow)
-                scale = min(1 + (strength / trend_strong_threshold), max_position_scale)
-                dynamic_tp = take_profit_base * (1 + 0.5 * min(scale - 1, 1.5))
-            else:
-                dynamic_tp = take_profit_base
-        else:
-            dynamic_tp = take_profit_base
+        if df is None or len(df) < trend_slow + 5:
+            continue
 
+        atr = calculate_atr(df, atr_period)
+        price = float(df["close"].iloc[-1])
+
+        if not price or not atr or atr / price < atr_vol_threshold:
+            continue
+
+        strength = trend_strength(df, trend_fast, trend_slow)
+
+        # Scale TP based on trend strength (from risk.py dynamic_take_profit)
+        scale = min(1 + (strength / trend_strong_threshold), max_position_scale)
+        dynamic_tp = take_profit_base * (1 + 0.5 * min(scale - 1, 1.5))
         dynamic_sl = stop_loss_base * (0.8 if regime == "bear" else 1.0)
 
         # Add fee buffer so we only TP if gain meaningfully exceeds fees
@@ -1156,24 +1184,28 @@ def run_live_cycle(
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
             sstate.pop("entry_day", None)
-            sstate.pop("entry_date", None)
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=true_entry, exit_price=current_price,
                 pnl_pct=true_pnl_pct, pnl_usd=true_pnl_usd,
                 amount_usd=true_amount, strategy="dynamic_tp",
             )
+            sell_fill = client.get_fill_price(result["orderId"]) if not client.dry_run else None
+            actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
+            if sell_fill and true_entry and float(true_entry) > 0:
+                true_pnl_pct = (actual_exit - float(true_entry)) / float(true_entry)
+                true_pnl_usd = true_pnl_pct * float(true_amount)
             append_log(
                 log_file, "LIVE_SELL_SUBMITTED",
                 symbol=sym, side="SELL",
                 amount_usd=f"{true_amount:.2f}",
                 order_id=result["orderId"],
                 status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"DYNAMIC_TP entry={true_entry or 0:.2f} exit={current_price or 0:.2f} pnl={true_pnl_pct or 0:.2%} tp={fee_adjusted_tp:.2%} (base={dynamic_tp:.2%})",
+                details=f"DYNAMIC_TP entry={true_entry or 0:.2f} exit={actual_exit:.2f} pnl={true_pnl_pct or 0:.2%} tp={fee_adjusted_tp:.2%} fill={sell_fill or 'N/A'}",
             )
-            print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_TP pnl={true_pnl_pct or 0:.2%}")
-            notify_sell(sym, current_price or 0, true_pnl_pct, true_pnl_usd, true_amount, "dynamic_tp")
-            close_position(sym, float(current_price or 0), true_pnl_pct, true_pnl_usd, "dynamic_tp")
+            print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_TP pnl={true_pnl_pct or 0:.2%} fill={actual_exit:.2f}")
+            notify_sell(sym, actual_exit, true_pnl_pct, true_pnl_usd, true_amount, "dynamic_tp")
+            close_position(sym, actual_exit, true_pnl_pct, true_pnl_usd, "dynamic_tp")
             sstate["halt_until_day_key_et"] = dkey
 
         elif pnl_pct <= -dynamic_sl:
@@ -1184,7 +1216,6 @@ def run_live_cycle(
                 monitor.log_error("place_sell_sl", sell_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
-            monitor.trade_count += 1
             true_entry = sstate.get("entry_price") or entry_price
             true_amount = sstate.get("entry_amount") or pos_value
             true_pnl_pct = ((current_price - true_entry) / true_entry) if (true_entry and current_price and true_entry > 0) else pnl_pct
@@ -1192,24 +1223,28 @@ def run_live_cycle(
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
             sstate.pop("entry_day", None)
-            sstate.pop("entry_date", None)
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=true_entry, exit_price=current_price,
                 pnl_pct=true_pnl_pct, pnl_usd=true_pnl_usd,
                 amount_usd=true_amount, strategy="dynamic_sl",
             )
+            sell_fill = client.get_fill_price(result["orderId"]) if not client.dry_run else None
+            actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
+            if sell_fill and true_entry and float(true_entry) > 0:
+                true_pnl_pct = (actual_exit - float(true_entry)) / float(true_entry)
+                true_pnl_usd = true_pnl_pct * float(true_amount)
             append_log(
                 log_file, "LIVE_SELL_SUBMITTED",
                 symbol=sym, side="SELL",
                 amount_usd=f"{true_amount:.2f}",
                 order_id=result["orderId"],
                 status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"DYNAMIC_SL entry={true_entry or 0:.2f} exit={current_price or 0:.2f} pnl={true_pnl_pct or 0:.2%} sl={dynamic_sl:.2%}",
+                details=f"DYNAMIC_SL entry={true_entry or 0:.2f} exit={actual_exit:.2f} pnl={true_pnl_pct or 0:.2%} sl={dynamic_sl:.2%} fill={sell_fill or 'N/A'}",
             )
-            print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_SL pnl={true_pnl_pct or 0:.2%}")
-            notify_sell(sym, current_price or 0, true_pnl_pct, true_pnl_usd, true_amount, "dynamic_sl")
-            close_position(sym, float(current_price or 0), true_pnl_pct, true_pnl_usd, "dynamic_sl")
+            print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_SL pnl={true_pnl_pct or 0:.2%} fill={actual_exit:.2f}")
+            notify_sell(sym, actual_exit, true_pnl_pct, true_pnl_usd, true_amount, "dynamic_sl")
+            close_position(sym, actual_exit, true_pnl_pct, true_pnl_usd, "dynamic_sl")
             sstate["halt_until_day_key_et"] = dkey
             trigger_cooldown(sstate, loss_cooldown_days)
 
@@ -1357,7 +1392,6 @@ def run_live_cycle(
             open_positions += 1
             total_pos_value += alloc_value
             total_exposure = total_pos_value / total_equity
-            monitor.trade_count += 1
 
             # Store entry price and date in state for accurate PnL tracking and hold period
             sstate = sym_state(state, sym)
@@ -1366,9 +1400,15 @@ def run_live_cycle(
             sstate["entry_date"] = today_key_et()
             upsert_open_position(sym, price, today_key_et(), qty, alloc_value, signal_type)
 
+            # Fetch actual fill price from Public API (more accurate than Polygon close)
+            fill_price = client.get_fill_price(result["orderId"]) if not client.dry_run else None
+            actual_entry = fill_price if fill_price and fill_price > 0 else price
+            if fill_price and fill_price != price:
+                print_status("FILL_PRICE", f"{sym} fill={fill_price:.4f} vs polygon={price:.4f}")
+
             log_trade(
                 symbol=sym, side="BUY",
-                entry_price=price, exit_price=None,
+                entry_price=actual_entry, exit_price=None,
                 pnl_pct=None, pnl_usd=None,
                 amount_usd=alloc_value, strategy=signal_type,
             )
@@ -1378,10 +1418,13 @@ def run_live_cycle(
                 amount_usd=f"{alloc_value:.2f}",
                 order_id=result["orderId"],
                 status="SUBMITTED" if not client.dry_run else "DRY_RUN",
-                details=f"signal={signal_type} confidence={confidence:.4f} conf_factor={conf_factor:.2f} strength={strength:.4f} scale={scale:.2f} alloc={alloc_value:.2f} price={price:.4f}",
+                details=f"signal={signal_type} confidence={confidence:.4f} conf_factor={conf_factor:.2f} strength={strength:.4f} scale={scale:.2f} alloc={alloc_value:.2f} price={actual_entry:.4f} fill={fill_price or 'N/A'}",
             )
-            print_status("BUY_SUBMITTED", f"{sym} alloc=${alloc_value:.2f} confidence={confidence:.4f} signal={signal_type}")
-            notify_buy(sym, price, alloc_value, signal_type, confidence)
+            # Store actual fill price in state for accurate exit PnL
+            sstate["entry_price"] = actual_entry
+            print_status("BUY_SUBMITTED", f"{sym} alloc=${alloc_value:.2f} confidence={confidence:.4f} signal={signal_type} fill={actual_entry:.2f}")
+            notify_buy(sym, actual_entry, alloc_value, signal_type, confidence)
+            upsert_open_position(sym, actual_entry, today_key_et(), qty, alloc_value, signal_type)
 
     save_state(state)
 
