@@ -203,3 +203,68 @@ def notify_regime_change(
         footer="Stock Trading Bot",
     )
     _send(payload)
+
+
+def notify_daily_summary(
+    date_str: str,
+    equity: float,
+    buying_power: float,
+    open_positions: list[dict],
+    trades_today: int,
+    wins_today: int,
+    losses_today: int,
+    pnl_today_usd: float,
+    regime: Optional[str],
+    last_run: str,
+    hours_since_run: float,
+) -> None:
+    """Send a daily summary embed to Discord."""
+    regime_emoji = "🟢" if regime == "bull" else "🔴" if regime == "bear" else "⚪"
+    pnl_color = COLOR_GREEN if pnl_today_usd >= 0 else COLOR_RED
+    health_emoji = "✅" if hours_since_run < 2 else "⚠️"
+
+    # Build open positions string
+    if open_positions:
+        pos_lines = []
+        for p in open_positions:
+            sym = p.get("symbol", "?")
+            entry = p.get("entry_price")
+            entry_str = f"${entry:.2f}" if entry else "?"
+            pos_lines.append(f"`{sym}` @ {entry_str}")
+        pos_str = ", ".join(pos_lines)
+    else:
+        pos_str = "None"
+
+    fields = [
+        {"name": "📊 Equity", "value": f"${equity:.2f}", "inline": True},
+        {"name": "💵 Buying Power", "value": f"${buying_power:.2f}", "inline": True},
+        {"name": f"{regime_emoji} Regime", "value": (regime or "unknown").upper(), "inline": True},
+        {"name": "📈 Trades Today", "value": f"{trades_today} ({wins_today}W / {losses_today}L)", "inline": True},
+        {"name": "💰 PnL Today", "value": f"${pnl_today_usd:+.2f}", "inline": True},
+        {"name": f"{health_emoji} Last Run", "value": f"{last_run} ({hours_since_run:.1f}h ago)", "inline": True},
+        {"name": "📋 Open Positions", "value": pos_str, "inline": False},
+    ]
+
+    payload: dict[str, Any] = _embed(
+        title=f"📅 Daily Summary — {date_str}",
+        description="End of day bot performance snapshot",
+        color=pnl_color,
+        fields=fields,
+        footer="Stock Trading Bot",
+    )
+    _send(payload)
+
+
+def notify_stale_bot(hours_since_run: float, last_run: str) -> None:
+    """Alert if bot hasn't run in too long during market hours."""
+    payload: dict[str, Any] = _embed(
+        title="⚠️ Bot Health Alert",
+        description=f"Bot hasn't run in **{hours_since_run:.1f} hours** during market hours.",
+        color=COLOR_RED,
+        fields=[
+            {"name": "Last Run", "value": last_run, "inline": True},
+            {"name": "Action", "value": "Check GitHub Actions", "inline": True},
+        ],
+        footer="Stock Trading Bot",
+    )
+    _send(payload)

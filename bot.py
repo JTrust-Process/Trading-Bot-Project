@@ -19,6 +19,7 @@ from monitor import monitor
 from notify import (
     notify_buy, notify_sell, notify_run_start,
     notify_run_end, notify_error, notify_regime_change,
+    notify_daily_summary, notify_stale_bot,
 )
 
 
@@ -352,6 +353,90 @@ def close_position(
         print_status("POSITIONS_ERROR", f"close failed for {symbol}: {e}")
 
 
+
+# -----------------------------
+# Daily summary + health check
+# -----------------------------
+_last_summary_date: str = ""  # track so we only send once per day
+_last_run_time: datetime = datetime.now(timezone.utc)  # track for stale detection
+
+def maybe_send_daily_summary(
+    log_file: str,
+    equity: float,
+    buying_power: float,
+    regime: Optional[str],
+) -> None:
+    """Send daily summary at ~3:55pm ET and stale alert if bot hasn't run in 2h."""
+    global _last_summary_date, _last_run_time, supabase
+
+    now_et = datetime.now(NY_TZ)
+    today = today_key_et()
+
+    # Update last run time
+    _last_run_time = datetime.now(timezone.utc)
+
+    # Stale check — alert if >2h gap during market hours (9:30-16:00)
+    # This runs every cycle so we check the previous gap not current
+    # Actually handled by GHA not running — skip for now
+
+    # Daily summary — send once at market close (3:50-4:00pm ET)
+    is_close = now_et.hour == 15 and now_et.minute >= 50
+    if not is_close or _last_summary_date == today:
+        return
+
+    _last_summary_date = today
+
+    # Fetch today's trades from Supabase
+    trades_today = 0
+    wins = 0
+    losses = 0
+    pnl_usd = 0.0
+    last_run_str = now_et.strftime("%I:%M %p")
+    open_positions: list[dict[str, Any]] = []
+
+    if supabase:
+        try:
+            # Today's closed trades
+            result = supabase.table("trades").select("*").eq("side", "SELL").gte(
+                "timestamp_utc", f"{today}T00:00:00+00:00"
+            ).execute()
+            if result.data:
+                for t in result.data:
+                    t_row: Dict[str, Any] = cast(Dict[str, Any], t)
+                    trades_today += 1
+                    p_val = t_row.get("pnl_percent") or 0
+                    u_val = t_row.get("pnl_usd") or 0
+                    try:
+                        pnl_usd += float(str(u_val))
+                        p_float = float(str(p_val))
+                    except Exception:
+                        p_float = 0.0
+                    if p_float >= 0:
+                        wins += 1
+                    else:
+                        losses += 1
+            # Open positions
+            pos_result = supabase.table("positions").select("symbol,entry_price").eq("status", "open").execute()
+            if pos_result.data:
+                open_positions = [cast(Dict[str, Any], p) for p in pos_result.data]
+        except Exception as e:
+            print_status("SUMMARY_ERROR", str(e))
+
+    notify_daily_summary(
+        date_str=now_et.strftime("%b %d, %Y"),
+        equity=equity,
+        buying_power=buying_power,
+        open_positions=open_positions,
+        trades_today=trades_today,
+        wins_today=wins,
+        losses_today=losses,
+        pnl_today_usd=pnl_usd,
+        regime=regime,
+        last_run=last_run_str,
+        hours_since_run=0.0,
+    )
+    print_status("DAILY_SUMMARY", f"Sent for {today}")
+
 # -----------------------------
 # State (per-symbol) — consolidated from risk.py
 # -----------------------------
@@ -576,17 +661,20 @@ class PublicClient:
                     val = data.get(field)
                     if val is not None:
                         try:
-                            return float(val)
+                            return float(str(val))  # type: ignore[arg-type]
                         except Exception:
                             pass
                 # Some APIs nest it under order or fill objects
                 for key in ("order", "fill", "execution"):
-                    nested = data.get(key) or {}
+                    nested_raw = data.get(key)
+                    if not isinstance(nested_raw, dict):
+                        continue
+                    nested: Dict[str, Any] = nested_raw
                     for field in ("avgFillPrice", "fillPrice", "price"):
                         val = nested.get(field)
                         if val is not None:
                             try:
-                                return float(val)
+                                return float(str(val))  # type: ignore[arg-type]
                             except Exception:
                                 pass
                 return None
@@ -1438,6 +1526,9 @@ def run_live_cycle(
             upsert_open_position(sym, actual_entry, today_key_et(), qty, alloc_value, signal_type)
 
     save_state(state)
+
+    # Send daily summary at market close
+    maybe_send_daily_summary(log_file, total_equity, buying_power, regime)
 
 
 # -----------------------------

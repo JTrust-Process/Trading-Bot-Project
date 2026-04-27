@@ -1,0 +1,80 @@
+name: bot-health-check
+
+on:
+  schedule:
+    # Run every 2 hours during market hours Mon-Fri (11:00, 13:00, 15:00, 17:00 UTC = 7am-1pm ET)
+    - cron: "0 11,13,15,17 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests python-dotenv supabase
+
+      - name: Check bot health
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python3 << 'PYEOF'
+          import os
+          import requests
+          from datetime import datetime, timezone, timedelta
+          from supabase import create_client
+
+          sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+          webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
+
+          # Get last BOT_START log
+          result = sb.table("bot_logs").select("timestamp_utc").eq("event", "BOT_START").order(
+              "timestamp_utc", desc=True
+          ).limit(1).execute()
+
+          if not result.data:
+              last_run = "Never"
+              hours_ago = 999.0
+          else:
+              last_ts = result.data[0]["timestamp_utc"]
+              try:
+                  last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+                  hours_ago = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+                  last_run = last_dt.strftime("%b %d %I:%M %p UTC")
+              except Exception:
+                  last_run = last_ts
+                  hours_ago = 0.0
+
+          print(f"Last run: {last_run} ({hours_ago:.1f}h ago)")
+
+          # Alert if >2.5 hours since last run during market hours
+          if hours_ago > 2.5 and webhook:
+              payload = {
+                  "embeds": [{
+                      "title": "⚠️ Bot Health Alert",
+                      "description": f"Bot hasn't run in **{hours_ago:.1f} hours**. Check GitHub Actions.",
+                      "color": 0xff3864,
+                      "fields": [
+                          {"name": "Last Run", "value": last_run, "inline": True},
+                          {"name": "Expected", "value": "Every ~1 hour", "inline": True},
+                      ],
+                      "footer": {"text": "Stock Trading Bot Health Check"},
+                      "timestamp": datetime.now(timezone.utc).isoformat(),
+                  }]
+              }
+              requests.post(webhook, json=payload, timeout=10)
+              print("Alert sent to Discord")
+          else:
+              print(f"Bot healthy — last run {hours_ago:.1f}h ago")
+          PYEOF
