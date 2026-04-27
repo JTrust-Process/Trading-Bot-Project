@@ -71,8 +71,8 @@ jobs:
  
           # ── Regime filter ──────────────────────────────────────────────────
           REGIME_SYMBOL: "SPY"
-          REGIME_FAST: "50"
-          REGIME_SLOW: "200"
+          REGIME_FAST: "20"
+          REGIME_SLOW: "50"
  
           # ── ATR / trend ────────────────────────────────────────────────────
           ATR_PERIOD: "14"

@@ -625,20 +625,31 @@ class PublicClient:
 def get_market_regime() -> Optional[str]:
     """
     Returns 'bull', 'bear', or None if data unavailable.
-    Uses SPY price vs 50-day SMA (fits within Alpha Vantage free tier 100-bar limit).
-    Bull = price above 50 SMA, Bear = price below 50 SMA.
+
+    Uses dual SMA confirmation:
+      - Bull: price above BOTH 20-day AND 50-day SMA
+      - Bear: price below EITHER SMA
+
+    The 20-day reacts faster (catches short-term selloffs like tariff events).
+    The 50-day filters out noise and confirms the broader trend.
+    Both must agree before calling bull — one disagreement = bear.
     """
     try:
         regime_symbol = os.getenv("REGIME_SYMBOL", "SPY")
-        sma_period = 50  # must fit within 100-bar compact limit
-        df = get_daily_bars(regime_symbol, sma_period + 10)
-        if df is None or len(df) < sma_period:
+        fast_period = int(os.getenv("REGIME_FAST", "20"))   # short-term filter
+        slow_period = int(os.getenv("REGIME_SLOW", "50"))   # medium-term filter
+        df = get_daily_bars(regime_symbol, slow_period + 10)
+        if df is None or len(df) < slow_period:
             print_status("REGIME", f"insufficient data (got {len(df) if df is not None else 0} bars)")
             return None
-        sma = df["close"].rolling(sma_period).mean().iloc[-1]
+        sma_fast = df["close"].rolling(fast_period).mean().iloc[-1]
+        sma_slow = df["close"].rolling(slow_period).mean().iloc[-1]
         price = df["close"].iloc[-1]
-        regime = "bull" if price > sma else "bear"
-        print_status("REGIME", f"price={price:.2f} sma50={sma:.2f} -> {regime}")
+        # Both SMAs must confirm bull — if either disagrees it's bear
+        above_fast = price > sma_fast
+        above_slow = price > sma_slow
+        regime = "bull" if (above_fast and above_slow) else "bear"
+        print_status("REGIME", f"price={price:.2f} sma{fast_period}={sma_fast:.2f} sma{slow_period}={sma_slow:.2f} above_fast={above_fast} above_slow={above_slow} -> {regime}")
         return regime
     except Exception as e:
         print_status("REGIME_ERROR", str(e))
