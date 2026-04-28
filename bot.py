@@ -398,8 +398,10 @@ def maybe_send_daily_summary(
     if supabase:
         try:
             # Today's closed trades
+            # Use UTC date range for today (market hours are 9:30am-4pm ET = 14:30-21:00 UTC)
+            today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             result = supabase.table("trades").select("*").eq("side", "SELL").gte(
-                "timestamp_utc", f"{today}T00:00:00+00:00"
+                "timestamp_utc", f"{today_utc}T00:00:00+00:00"
             ).execute()
             if result.data:
                 for t in result.data:
@@ -617,12 +619,12 @@ class PublicClient:
         seed = f"{account_id}:{now_min}:{side}:{symbol}"
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
-    def place_market_buy_quantity(self, symbol: str, quantity: float, price: float = 0.0) -> Dict[str, Any]:
-        if quantity <= 0:
-            raise ValueError("quantity must be > 0")
+    def place_market_buy_amount(self, symbol: str, amount_usd: float, price: float = 0.0) -> Dict[str, Any]:
+        if amount_usd <= 0:
+            raise ValueError("amount_usd must be > 0")
         account_id = self.get_account_id()
         order_id = self.deterministic_order_id(account_id, "BUY", symbol)
-        notional = round(quantity * price, 2) if price > 0 else round(quantity, 2)
+        notional = round(amount_usd, 2)
         payload: Dict[str, Any] = {
             "orderId": order_id,
             "instrument": {"symbol": symbol, "type": "EQUITY"},
@@ -1160,24 +1162,24 @@ def run_live_cycle(
             trades_today += 1
             monitor.trade_count += 1
             monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "SELL", "strategy": "momentum_exit"})
-            true_entry = sstate.get("entry_price") or entry_price
-            true_amount = sstate.get("entry_amount") or pos_value
-            true_pnl_pct = ((current_price - true_entry) / true_entry) if (true_entry and current_price and true_entry > 0) else pnl_pct
-            true_pnl_usd = (true_pnl_pct * true_amount) if true_pnl_pct is not None else pnl_usd
+            # Fetch fill price FIRST, then compute PnL, then log — correct order
+            sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
+            true_entry = float(sstate.get("entry_price") or entry_price or 0)
+            true_amount = float(sstate.get("entry_amount") or pos_value or 0)
+            actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
+            true_pnl_pct = ((actual_exit - true_entry) / true_entry) if true_entry > 0 else None
+            true_pnl_usd = (true_pnl_pct * true_amount) if true_pnl_pct is not None else None
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
             sstate.pop("entry_day", None)
+            sstate.pop("entry_date", None)
             log_trade(
                 symbol=sym, side="SELL",
-                entry_price=true_entry, exit_price=current_price,
+                entry_price=true_entry if true_entry > 0 else None,
+                exit_price=actual_exit,
                 pnl_pct=true_pnl_pct, pnl_usd=true_pnl_usd,
                 amount_usd=true_amount, strategy="momentum_exit",
             )
-            sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
-            actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
-            if sell_fill and true_entry and float(true_entry) > 0:
-                true_pnl_pct = (actual_exit - float(true_entry)) / float(true_entry)
-                true_pnl_usd = true_pnl_pct * float(true_amount)
             append_log(
                 log_file, "LIVE_SELL_SUBMITTED",
                 symbol=sym, side="SELL",
@@ -1312,24 +1314,24 @@ def run_live_cycle(
                 continue
             trades_today += 1
             # Use stored entry price for accurate PnL if available
-            true_entry = sstate.get("entry_price") or entry_price
-            true_amount = sstate.get("entry_amount") or pos_value
-            true_pnl_pct = ((current_price - true_entry) / true_entry) if (true_entry and current_price and true_entry > 0) else pnl_pct
-            true_pnl_usd = (true_pnl_pct * true_amount) if true_pnl_pct is not None else pnl_usd
+            # Fetch fill price FIRST, then compute PnL, then log — correct order
+            sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
+            true_entry = float(sstate.get("entry_price") or entry_price or 0)
+            true_amount = float(sstate.get("entry_amount") or pos_value or 0)
+            actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
+            true_pnl_pct = ((actual_exit - true_entry) / true_entry) if true_entry > 0 else None
+            true_pnl_usd = (true_pnl_pct * true_amount) if true_pnl_pct is not None else None
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
             sstate.pop("entry_day", None)
+            sstate.pop("entry_date", None)
             log_trade(
                 symbol=sym, side="SELL",
-                entry_price=true_entry, exit_price=current_price,
+                entry_price=true_entry if true_entry > 0 else None,
+                exit_price=actual_exit,
                 pnl_pct=true_pnl_pct, pnl_usd=true_pnl_usd,
                 amount_usd=true_amount, strategy="dynamic_tp",
             )
-            sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
-            actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
-            if sell_fill and true_entry and float(true_entry) > 0:
-                true_pnl_pct = (actual_exit - float(true_entry)) / float(true_entry)
-                true_pnl_usd = true_pnl_pct * float(true_amount)
             append_log(
                 log_file, "LIVE_SELL_SUBMITTED",
                 symbol=sym, side="SELL",
@@ -1351,24 +1353,24 @@ def run_live_cycle(
                 monitor.log_error("place_sell_sl", sell_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
-            true_entry = sstate.get("entry_price") or entry_price
-            true_amount = sstate.get("entry_amount") or pos_value
-            true_pnl_pct = ((current_price - true_entry) / true_entry) if (true_entry and current_price and true_entry > 0) else pnl_pct
-            true_pnl_usd = (true_pnl_pct * true_amount) if true_pnl_pct is not None else pnl_usd
+            # Fetch fill price FIRST, then compute PnL, then log — correct order
+            sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
+            true_entry = float(sstate.get("entry_price") or entry_price or 0)
+            true_amount = float(sstate.get("entry_amount") or pos_value or 0)
+            actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
+            true_pnl_pct = ((actual_exit - true_entry) / true_entry) if true_entry > 0 else None
+            true_pnl_usd = (true_pnl_pct * true_amount) if true_pnl_pct is not None else None
             sstate.pop("entry_price", None)
             sstate.pop("entry_amount", None)
             sstate.pop("entry_day", None)
+            sstate.pop("entry_date", None)
             log_trade(
                 symbol=sym, side="SELL",
-                entry_price=true_entry, exit_price=current_price,
+                entry_price=true_entry if true_entry > 0 else None,
+                exit_price=actual_exit,
                 pnl_pct=true_pnl_pct, pnl_usd=true_pnl_usd,
                 amount_usd=true_amount, strategy="dynamic_sl",
             )
-            sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
-            actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
-            if sell_fill and true_entry and float(true_entry) > 0:
-                true_pnl_pct = (actual_exit - float(true_entry)) / float(true_entry)
-                true_pnl_usd = true_pnl_pct * float(true_amount)
             append_log(
                 log_file, "LIVE_SELL_SUBMITTED",
                 symbol=sym, side="SELL",
@@ -1517,7 +1519,7 @@ def run_live_cycle(
                 continue
 
             try:
-                result = client.place_market_buy_quantity(sym, qty, price)
+                result = client.place_market_buy_amount(sym, qty, price)
             except Exception as order_err:
                 append_log(log_file, "ORDER_ERROR", symbol=sym,
                     details=f"BUY failed: {order_err} qty={qty:.8f} alloc={alloc_value:.2f} price={price:.4f}")

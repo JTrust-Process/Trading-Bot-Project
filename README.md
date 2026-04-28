@@ -21,7 +21,7 @@ GitHub Actions (cron) → bot.py → Public.com API (orders)
 - **Momentum rotation** — ranks symbols by weighted short-term returns `(1d×0.3) + (5d×0.4) + (10d×0.3)` and buys the top N leaders
 - **Volatility breakout** — detects price breakouts above a 20-bar consolidation range, with separate thresholds for bull/bear regimes
 - **Confidence scoring** — combines momentum, trend strength, and breakout margin into a 0–1 score that scales position size
-- **Market regime filter** — SPY 50/200 SMA determines bull/bear; momentum buys blocked in bear, breakouts allowed with stricter thresholds and half sizing
+- **Market regime filter** — Dual SMA (20/50-day) determines bull/bear. Price must be above BOTH SMAs for bull — faster reaction than single SMA; momentum buys blocked in bear, breakouts allowed with stricter thresholds and half sizing
 - **Risk management** — dynamic TP/SL, daily loss limit, max drawdown, multi-day cooldowns, exposure caps
 - **Full observability** — every log event mirrored to Supabase `bot_logs`, run lifecycle tracked in `bot_runs`, errors in `bot_errors`
 - **Discord notifications** — rich embeds for buys, sells, run summaries, errors, and regime changes
@@ -164,8 +164,9 @@ All config is set via environment variables. Key parameters:
 | `DAILY_LOSS_LIMIT` | `0.03` | Daily loss limit per symbol (3%) |
 | `LOSS_COOLDOWN_DAYS` | `3` | Days to halt symbol after loss |
 | `REGIME_SYMBOL` | `SPY` | Symbol used for regime detection |
-| `REGIME_FAST` | `50` | Fast SMA for regime (50-day) |
-| `REGIME_SLOW` | `200` | Slow SMA for regime (200-day) |
+| `REGIME_FAST` | `20` | Fast SMA for regime (20-day) — price must be above this |
+| `REGIME_SLOW` | `50` | Slow SMA for regime (50-day) — price must be above this |
+| `MIN_HOLD_DAYS` | `2` | Minimum days to hold before selling (prevents PDT) |
 | `CONFIDENCE_MIN_THRESHOLD` | `0.3` | Minimum confidence score to buy |
 | `BREAKOUT_LOOKBACK` | `20` | Bars to define consolidation range |
 | `BREAKOUT_THRESHOLD_BULL` | `0.1` | Bull breakout threshold (10% of range) |
@@ -223,7 +224,7 @@ python backtest.py \
 | Bot engine | Python 3.11 |
 | Scheduling | GitHub Actions (hourly, Mon–Fri) |
 | Brokerage | Public.com API |
-| Price data | yfinance |
+| Price data | Polygon.io |
 | Database | Supabase (PostgreSQL) |
 | Dashboard | Next.js 16, Tailwind, Recharts, Framer Motion |
 | Hosting | Vercel |
