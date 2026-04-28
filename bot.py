@@ -293,6 +293,7 @@ def upsert_open_position(
     quantity: float,
     amount_usd: float,
     strategy: str,
+    estimated: bool = False,
 ) -> None:
     """Insert or update an open position in Supabase. Never crashes the bot."""
     global supabase
@@ -641,45 +642,80 @@ class PublicClient:
         resp.raise_for_status()
         return {"orderId": order_id, "response": resp.json()}
 
-    def get_fill_price(self, order_id: str) -> Optional[float]:
+    def get_fill_price(self, order_id: str, log_file: str = "") -> Optional[float]:
         """
         Fetch actual fill price for a completed order.
-        Waits up to 5s for the order to settle then reads avgFillPrice.
-        Returns None if unavailable — caller falls back to market price.
+        Retries up to 4 times with 2s waits (8s total) to allow order to settle.
+        Logs the full response to bot_logs so we can discover Public's exact field names.
+        Returns None if unavailable — caller marks entry as estimated.
         """
         account_id = self.get_account_id()
         url = f"{ORDER_URL_TMPL.format(accountId=account_id)}/{order_id}"
-        for _ in range(3):
+        last_data: Dict[str, Any] = {}
+
+        for attempt in range(4):
             try:
                 time.sleep(2)
                 resp = requests.get(url, headers=self.auth.auth_headers(), timeout=15)
+
                 if resp.status_code != 200:
-                    return None
+                    print_status("FILL_PRICE_ERROR", f"order={order_id} status={resp.status_code} attempt={attempt+1}")
+                    continue
+
                 data: Dict[str, Any] = resp.json()
-                # Try common field names Public might use
-                for field in ("avgFillPrice", "fillPrice", "averageFillPrice", "price", "filledPrice"):
+                last_data = data
+
+                # Log full response on first attempt so we can see Public's fields
+                if attempt == 0 and log_file:
+                    import json as _json
+                    append_log(log_file, "ORDER_RESPONSE", symbol="",
+                        details=f"order_id={order_id} keys={list(data.keys())} raw={_json.dumps(data)[:500]}")
+
+                # Try all known field names at top level
+                for field in ("avgFillPrice", "fillPrice", "averageFillPrice",
+                               "price", "filledPrice", "executedPrice", "avgPrice",
+                               "filled_price", "fill_price", "average_price"):
                     val = data.get(field)
                     if val is not None:
                         try:
-                            return float(str(val))  # type: ignore[arg-type]
+                            fp = float(str(val))  # type: ignore[arg-type]
+                            if fp > 0:
+                                print_status("FILL_PRICE", f"order={order_id} field={field} price={fp:.4f}")
+                                return fp
                         except Exception:
                             pass
-                # Some APIs nest it under order or fill objects
-                for key in ("order", "fill", "execution"):
+
+                # Try nested objects
+                for key in ("order", "fill", "execution", "orderExecution", "fills"):
                     nested_raw = data.get(key)
                     if not isinstance(nested_raw, dict):
                         continue
                     nested: Dict[str, Any] = nested_raw
-                    for field in ("avgFillPrice", "fillPrice", "price"):
+                    for field in ("avgFillPrice", "fillPrice", "price",
+                                   "executedPrice", "averagePrice", "avgPrice"):
                         val = nested.get(field)
                         if val is not None:
                             try:
-                                return float(str(val))  # type: ignore[arg-type]
+                                fp = float(str(val))  # type: ignore[arg-type]
+                                if fp > 0:
+                                    print_status("FILL_PRICE", f"order={order_id} nested={key}.{field} price={fp:.4f}")
+                                    return fp
                             except Exception:
                                 pass
-                return None
-            except Exception:
-                return None
+
+                # Order may not be filled yet — retry
+                status = str(data.get("status") or data.get("orderStatus") or "unknown")
+                print_status("FILL_PRICE_RETRY", f"order={order_id} status={status} attempt={attempt+1}/4 keys={list(data.keys())}")
+
+            except Exception as e:
+                print_status("FILL_PRICE_EXCEPTION", f"order={order_id} attempt={attempt+1} err={e}")
+
+        # Log that we couldn't find fill price so it shows in bot logs
+        if log_file:
+            import json as _json
+            append_log(log_file, "FILL_PRICE_UNKNOWN", symbol="",
+                details=f"order_id={order_id} could not find fill price — entry marked as estimated. keys={list(last_data.keys())}")
+        print_status("FILL_PRICE_UNKNOWN", f"order={order_id} — using estimated price")
         return None
 
     def place_market_sell_quantity(self, symbol: str, quantity: float) -> Dict[str, Any]:
@@ -1137,7 +1173,7 @@ def run_live_cycle(
                 pnl_pct=true_pnl_pct, pnl_usd=true_pnl_usd,
                 amount_usd=true_amount, strategy="momentum_exit",
             )
-            sell_fill = client.get_fill_price(result["orderId"]) if not client.dry_run else None
+            sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
             actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
             if sell_fill and true_entry and float(true_entry) > 0:
                 true_pnl_pct = (actual_exit - float(true_entry)) / float(true_entry)
@@ -1289,7 +1325,7 @@ def run_live_cycle(
                 pnl_pct=true_pnl_pct, pnl_usd=true_pnl_usd,
                 amount_usd=true_amount, strategy="dynamic_tp",
             )
-            sell_fill = client.get_fill_price(result["orderId"]) if not client.dry_run else None
+            sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
             actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
             if sell_fill and true_entry and float(true_entry) > 0:
                 true_pnl_pct = (actual_exit - float(true_entry)) / float(true_entry)
@@ -1328,7 +1364,7 @@ def run_live_cycle(
                 pnl_pct=true_pnl_pct, pnl_usd=true_pnl_usd,
                 amount_usd=true_amount, strategy="dynamic_sl",
             )
-            sell_fill = client.get_fill_price(result["orderId"]) if not client.dry_run else None
+            sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
             actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
             if sell_fill and true_entry and float(true_entry) > 0:
                 true_pnl_pct = (actual_exit - float(true_entry)) / float(true_entry)
@@ -1500,10 +1536,9 @@ def run_live_cycle(
             upsert_open_position(sym, price, today_key_et(), qty, alloc_value, signal_type)
 
             # Fetch actual fill price from Public API (more accurate than Polygon close)
-            fill_price = client.get_fill_price(result["orderId"]) if not client.dry_run else None
+            fill_price = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
             actual_entry = fill_price if fill_price and fill_price > 0 else price
-            if fill_price and fill_price != price:
-                print_status("FILL_PRICE", f"{sym} fill={fill_price:.4f} vs polygon={price:.4f}")
+            entry_is_estimated = fill_price is None or fill_price <= 0
 
             log_trade(
                 symbol=sym, side="BUY",
@@ -1523,7 +1558,7 @@ def run_live_cycle(
             sstate["entry_price"] = actual_entry
             print_status("BUY_SUBMITTED", f"{sym} alloc=${alloc_value:.2f} confidence={confidence:.4f} signal={signal_type} fill={actual_entry:.2f}")
             notify_buy(sym, actual_entry, alloc_value, signal_type, confidence)
-            upsert_open_position(sym, actual_entry, today_key_et(), qty, alloc_value, signal_type)
+            upsert_open_position(sym, actual_entry, today_key_et(), qty, alloc_value, signal_type, estimated=entry_is_estimated)
 
     save_state(state)
 
