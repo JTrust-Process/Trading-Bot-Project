@@ -414,6 +414,7 @@ def maybe_send_daily_summary(
                 for t in result.data:
                     t_row: Dict[str, Any] = cast(Dict[str, Any], t)
                     trades_today += 1
+                    monitor.trade_count += 1
                     p_val = t_row.get("pnl_percent") or 0
                     u_val = t_row.get("pnl_usd") or 0
                     try:
@@ -1100,6 +1101,7 @@ def run_live_cycle(
             qty = snap["qty"]
             result = client.place_market_sell_quantity(sym, qty)
             trades_today += 1
+            monitor.trade_count += 1
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=snap["avg_cost"], exit_price=snap["last"],
@@ -1243,6 +1245,7 @@ def run_live_cycle(
                 monitor.log_error("place_sell_daily_loss", sell_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
+            monitor.trade_count += 1
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=entry_price, exit_price=current_price,
@@ -1271,6 +1274,7 @@ def run_live_cycle(
                 monitor.log_error("place_sell_max_drawdown", sell_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
+            monitor.trade_count += 1
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=entry_price, exit_price=current_price,
@@ -1336,6 +1340,7 @@ def run_live_cycle(
                 monitor.log_error("place_sell_tp", sell_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
+            monitor.trade_count += 1
             # Use stored entry price for accurate PnL if available
             # Fetch fill price FIRST, then compute PnL, then log — correct order
             sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
@@ -1376,6 +1381,7 @@ def run_live_cycle(
                 monitor.log_error("place_sell_sl", sell_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
+            monitor.trade_count += 1
             # Fetch fill price FIRST, then compute PnL, then log — correct order
             sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
             true_entry = float(sstate.get("entry_price") or entry_price or 0)
@@ -1549,6 +1555,7 @@ def run_live_cycle(
                 monitor.log_error("place_buy", order_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
+            monitor.trade_count += 1
             open_positions += 1
             total_pos_value += alloc_value
             total_exposure = total_pos_value / total_equity
