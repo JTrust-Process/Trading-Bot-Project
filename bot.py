@@ -641,6 +641,8 @@ class PublicClient:
             json=payload,
             timeout=30,
         )
+        if not resp.ok:
+            print_status("ORDER_RESPONSE_ERROR", f"BUY {symbol} status={resp.status_code} body={resp.text[:500]}")
         resp.raise_for_status()
         return {"orderId": order_id, "response": resp.json()}
 
@@ -741,6 +743,8 @@ class PublicClient:
             json=payload,
             timeout=30,
         )
+        if not resp.ok:
+            print_status("ORDER_RESPONSE_ERROR", f"BUY {symbol} status={resp.status_code} body={resp.text[:500]}")
         resp.raise_for_status()
         return {"orderId": order_id, "response": resp.json()}
 
@@ -1136,7 +1140,14 @@ def run_live_cycle(
             continue
 
         # Minimum hold period — prevents PDT violations (default 1 = no same-day sells)
+        # Pull entry_date from Supabase if not in local state (fresh GHA runner)
         entry_date_str = str(sstate.get("entry_date") or sstate.get("entry_day") or "")
+        if not entry_date_str:
+            _pos = get_open_position(sym)
+            if _pos:
+                entry_date_str = str(_pos.get("entry_date") or "")
+                if entry_date_str:
+                    sstate["entry_date"] = entry_date_str
         if entry_date_str and min_hold_days > 0:
             try:
                 entry_dt = datetime.strptime(entry_date_str, "%Y-%m-%d").date()

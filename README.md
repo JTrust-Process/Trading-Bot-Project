@@ -126,6 +126,33 @@ create policy "Allow public read" on trades for select using (true);
 -- repeat for bot_runs, bot_events, bot_errors, bot_logs
 ```
 
+Also create the positions table for open/closed position tracking:
+
+```sql
+create table positions (
+  id uuid default gen_random_uuid() primary key,
+  symbol text not null,
+  entry_price numeric,
+  entry_date text,
+  quantity numeric,
+  amount_usd numeric,
+  strategy text,
+  status text default 'open',
+  exit_price numeric,
+  exit_date text,
+  pnl_pct numeric,
+  pnl_usd numeric,
+  close_reason text,
+  entry_estimated boolean default false,
+  updated_at timestamptz default now()
+);
+
+alter table positions enable row level security;
+create policy "Allow public read" on positions for select using (true);
+alter publication supabase_realtime add table positions;
+```
+
+
 ### 4. Add GitHub Secrets
 
 Go to **Settings → Secrets → Actions** and add:
@@ -224,7 +251,7 @@ python backtest.py \
 | Bot engine | Python 3.11 |
 | Scheduling | GitHub Actions (hourly, Mon–Fri) |
 | Brokerage | Public.com API |
-| Price data | Polygon.io |
+| Price data | Polygon.io (free tier) |
 | Database | Supabase (PostgreSQL) |
 | Dashboard | Next.js 16, Tailwind, Recharts, Framer Motion |
 | Hosting | Vercel |

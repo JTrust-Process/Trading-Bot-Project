@@ -16,7 +16,6 @@ from datetime import datetime, timezone
 from typing import Optional, Any
 
 
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 COLOR_GREEN   = 0x00ff9f   # wins / buys / success
@@ -29,11 +28,12 @@ COLOR_GREY    = 0x888888   # unknown
 
 def _send(payload: dict[str, Any]) -> None:
     """Send a webhook payload. Never crashes the bot."""
-    if not DISCORD_WEBHOOK_URL:
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "")
+    if not webhook_url:
         return
     try:
         resp = requests.post(
-            DISCORD_WEBHOOK_URL,
+            webhook_url,
             json=payload,
             timeout=10,
         )

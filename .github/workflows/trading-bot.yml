@@ -6,6 +6,10 @@ on:
     # Every 15 minutes, Monday–Friday.
     - cron: "*/15 * * * 1-5"
 
+concurrency:
+  group: public-trading-bot
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
