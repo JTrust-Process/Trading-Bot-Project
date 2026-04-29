@@ -300,7 +300,13 @@ def upsert_open_position(
     if supabase is None:
         return
     try:
-        supabase.table("positions").upsert({
+        # Mark any existing open position as replaced
+        supabase.table("positions").update({
+            "status": "replaced",
+            "updated_at": utcnow().isoformat(),
+        }).eq("symbol", symbol).eq("status", "open").execute()
+        # Insert fresh record — no unique constraint needed
+        supabase.table("positions").insert({
             "symbol": symbol,
             "entry_price": entry_price,
             "entry_date": entry_date,
@@ -308,8 +314,9 @@ def upsert_open_position(
             "amount_usd": amount_usd,
             "strategy": strategy,
             "status": "open",
+            "entry_estimated": estimated,
             "updated_at": utcnow().isoformat(),
-        }, on_conflict="symbol").execute()
+        }).execute()
     except Exception as e:
         print_status("POSITIONS_ERROR", f"upsert failed for {symbol}: {e}")
 
@@ -676,7 +683,7 @@ class PublicClient:
                         details=f"order_id={order_id} keys={list(data.keys())} raw={_json.dumps(data)[:500]}")
 
                 # Try all known field names at top level
-                for field in ("avgFillPrice", "fillPrice", "averageFillPrice",
+                for field in ("averagePrice", "avgFillPrice", "fillPrice", "averageFillPrice",
                                "price", "filledPrice", "executedPrice", "avgPrice",
                                "filled_price", "fill_price", "average_price"):
                     val = data.get(field)
@@ -707,8 +714,13 @@ class PublicClient:
                             except Exception:
                                 pass
 
-                # Order may not be filled yet — retry
+                # Check if filled — if so averagePrice should be present, no point retrying
                 status = str(data.get("status") or data.get("orderStatus") or "unknown")
+                if status.upper() == "FILLED":
+                    # Order filled but no price parsed — log exact value for debugging
+                    print_status("FILL_PRICE_PARSE_MISS",
+                        f"order={order_id} FILLED but no price parsed. averagePrice={data.get('averagePrice')} keys={list(data.keys())}")
+                    break
                 print_status("FILL_PRICE_RETRY", f"order={order_id} status={status} attempt={attempt+1}/4 keys={list(data.keys())}")
 
             except Exception as e:
@@ -1546,7 +1558,6 @@ def run_live_cycle(
             sstate["entry_price"] = price
             sstate["entry_amount"] = alloc_value
             sstate["entry_date"] = today_key_et()
-            upsert_open_position(sym, price, today_key_et(), qty, alloc_value, signal_type)
 
             # Fetch actual fill price from Public API (more accurate than Polygon close)
             fill_price = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
