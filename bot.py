@@ -619,7 +619,7 @@ class PublicClient:
         seed = f"{account_id}:{now_min}:{side}:{symbol}"
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
-    def place_market_buy_amount(self, symbol: str, amount_usd: float, price: float = 0.0) -> Dict[str, Any]:
+    def place_market_buy_amount(self, symbol: str, amount_usd: float) -> Dict[str, Any]:
         if amount_usd <= 0:
             raise ValueError("amount_usd must be > 0")
         account_id = self.get_account_id()
@@ -1519,7 +1519,7 @@ def run_live_cycle(
                 continue
 
             try:
-                result = client.place_market_buy_amount(sym, qty, price)
+                result = client.place_market_buy_amount(sym, alloc_value)
             except Exception as order_err:
                 append_log(log_file, "ORDER_ERROR", symbol=sym,
                     details=f"BUY failed: {order_err} qty={qty:.8f} alloc={alloc_value:.2f} price={price:.4f}")
