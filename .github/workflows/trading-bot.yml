@@ -3,8 +3,9 @@ name: public-trading-bot
 on:
   workflow_dispatch: {}
   schedule:
-    # Every 15 minutes, Monday–Friday.
-    - cron: "*/15 * * * 1-5"
+    # Every 15 minutes during market hours (9:30am-4pm ET = 13:30-20:00 UTC)
+    # Offset from :00/:15/:30/:45 to avoid GHA high-load queuing
+    - cron: "7,22,37,52 13-20 * * 1-5"
 
 concurrency:
   group: public-trading-bot
