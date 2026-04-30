@@ -21,6 +21,7 @@ BREAKOUT_LOOKBACK          = int(float(os.getenv("BREAKOUT_LOOKBACK",           
 BREAKOUT_THRESHOLD_BULL    = float(os.getenv("BREAKOUT_THRESHOLD_BULL",         "0.1"))
 BREAKOUT_THRESHOLD_BEAR    = float(os.getenv("BREAKOUT_THRESHOLD_BEAR",         "0.3"))
 BREAKOUT_BEAR_SIZE_FACTOR  = float(os.getenv("BREAKOUT_BEAR_SIZE_FACTOR",       "0.5"))
+BREAKOUT_VOL_MULTIPLIER    = float(os.getenv("BREAKOUT_VOL_MULTIPLIER",         "1.2"))  # volume must be > 1.2x avg
 
 
 @dataclass
@@ -34,6 +35,7 @@ class BreakoutResult:
     range_size:    Optional[float] = None
     threshold:     Optional[float] = None   # actual price level needed
     size_factor:   float = 1.0              # multiply alloc by this
+    volume_ratio:  Optional[float] = None  # today_vol / avg_vol
     reason:        str = ""
 
 
@@ -92,7 +94,29 @@ def check_breakout(
         size_factor   = 1.0
 
     breakout_level = recent_high + (threshold_pct * range_size)
-    signal = price > breakout_level
+    price_breaks_out = price > breakout_level
+
+    # Volume confirmation — breakout must have above-average volume
+    # Low volume breakouts almost always fail (price spike with no conviction)
+    volume_ratio: Optional[float] = None
+    vol_confirmed = True  # default pass if volume data unavailable
+    if "volume" in df.columns:
+        vol_series = df["volume"]
+        today_vol = float(vol_series.iloc[-1])
+        avg_vol_window = vol_series.iloc[-(lookback + 1):-1]
+        if len(avg_vol_window) >= 5 and float(avg_vol_window.mean()) > 0:
+            avg_vol = float(avg_vol_window.mean())
+            volume_ratio = round(today_vol / avg_vol, 2)
+            vol_confirmed = volume_ratio >= BREAKOUT_VOL_MULTIPLIER
+
+    signal = price_breaks_out and vol_confirmed
+
+    if price_breaks_out and not vol_confirmed:
+        reason = f"price breakout but low volume ({volume_ratio:.2f}x < {BREAKOUT_VOL_MULTIPLIER}x avg required)"
+    elif signal:
+        reason = f"breakout volume={volume_ratio:.2f}x avg" if volume_ratio else "breakout"
+    else:
+        reason = f"price={price:.2f} below threshold={breakout_level:.2f}"
 
     return BreakoutResult(
         symbol=symbol,
@@ -104,5 +128,6 @@ def check_breakout(
         range_size=round(range_size, 4),
         threshold=round(breakout_level, 4),
         size_factor=size_factor,
-        reason="breakout" if signal else f"price={price:.2f} below threshold={breakout_level:.2f}",
+        volume_ratio=volume_ratio,
+        reason=reason,
     )

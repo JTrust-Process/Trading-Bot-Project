@@ -40,6 +40,23 @@ STOP_FILE = "STOP.txt"
 supabase = None
 _last_regime: str | None = None  # track regime changes for notifications
 
+def _load_last_regime_from_supabase() -> Optional[str]:
+    """Load last known regime from Supabase to avoid UNKNOWN → X spam on GHA restarts."""
+    global supabase
+    if supabase is None:
+        return None
+    try:
+        res = supabase.table("bot_logs").select("details").eq("event", "MARKET_REGIME").order(
+            "timestamp_utc", desc=True
+        ).limit(1).execute()
+        if res.data:
+            row: Dict[str, Any] = cast(Dict[str, Any], res.data[0])
+            val = str(row.get("details") or "").strip()
+            return val if val in ("bull", "bear") else None
+    except Exception:
+        pass
+    return None
+
 
 # -----------------------------
 # Time helpers
@@ -415,11 +432,12 @@ def maybe_send_daily_summary(
                     t_row: Dict[str, Any] = cast(Dict[str, Any], t)
                     trades_today += 1
                     monitor.trade_count += 1
-                    p_val = t_row.get("pnl_percent") or 0
+                    p_val = t_row.get("pnl_percent") or t_row.get("pnl_pct") or 0
                     u_val = t_row.get("pnl_usd") or 0
                     try:
-                        pnl_usd += float(str(u_val))
+                        u_float = float(str(u_val))
                         p_float = float(str(p_val))
+                        pnl_usd += u_float
                     except Exception:
                         p_float = 0.0
                     if p_float >= 0:
@@ -994,10 +1012,15 @@ def run_live_cycle(
 ) -> None:
 
     global _last_regime
+    # Restore last regime from Supabase so GHA fresh runners don't spam "UNKNOWN → BULL"
+    if _last_regime is None:
+        _last_regime = _load_last_regime_from_supabase()
     regime = get_market_regime()
     print_status("MARKET_REGIME", str(regime))
     if regime != _last_regime:
-        notify_regime_change(_last_regime, regime)
+        # Suppress UNKNOWN → X notifications (happens on fresh GHA runners)
+        if _last_regime is not None:
+            notify_regime_change(_last_regime, regime)
         _last_regime = regime
 
     # ── Momentum ranking (computed once per cycle) ───────────────────────────
@@ -1189,7 +1212,13 @@ def run_live_cycle(
             monitor.log_event("ORDER_FILLED", symbol=sym, metadata={"side": "SELL", "strategy": "momentum_exit"})
             # Fetch fill price FIRST, then compute PnL, then log — correct order
             sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
-            true_entry = float(sstate.get("entry_price") or entry_price or 0)
+            # Get entry price: local state → Supabase positions → snapshot → 0
+            _raw_entry = sstate.get("entry_price")
+            if not _raw_entry or float(_raw_entry) <= 0:
+                _pos = get_open_position(sym)
+                if _pos:
+                    _raw_entry = _pos.get("entry_price")
+            true_entry = float(_raw_entry or entry_price or 0)
             true_amount = float(sstate.get("entry_amount") or pos_value or 0)
             actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
             true_pnl_pct = ((actual_exit - true_entry) / true_entry) if true_entry > 0 else None
@@ -1214,7 +1243,13 @@ def run_live_cycle(
                 details=f"MOMENTUM_EXIT entry={true_entry or 0:.2f} exit={actual_exit:.2f} pnl={true_pnl_pct or 0:.2%} qty={qty:.8f} fill={sell_fill or 'N/A'}",
             )
             print_status("SELL_SUBMITTED", f"{sym} MOMENTUM_EXIT pnl={true_pnl_pct or 0:.2%} fill={actual_exit:.2f}")
-            notify_sell(sym, actual_exit, true_pnl_pct, true_pnl_usd, true_amount, "momentum_exit")
+            # Calculate estimated PnL for Discord if true values unavailable
+            _disc_pnl_pct = true_pnl_pct
+            _disc_pnl_usd = true_pnl_usd
+            if _disc_pnl_pct is None and true_entry > 0:
+                _disc_pnl_pct = (actual_exit - true_entry) / true_entry
+                _disc_pnl_usd = _disc_pnl_pct * true_amount
+            notify_sell(sym, actual_exit, _disc_pnl_pct, _disc_pnl_usd, true_amount, "momentum_exit")
             close_position(sym, actual_exit, true_pnl_pct, true_pnl_usd, "momentum_exit")
             sstate["halt_until_day_key_et"] = dkey
             continue
@@ -1344,7 +1379,12 @@ def run_live_cycle(
             # Use stored entry price for accurate PnL if available
             # Fetch fill price FIRST, then compute PnL, then log — correct order
             sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
-            true_entry = float(sstate.get("entry_price") or entry_price or 0)
+            _raw_entry = sstate.get("entry_price")
+            if not _raw_entry or float(_raw_entry) <= 0:
+                _pos = get_open_position(sym)
+                if _pos:
+                    _raw_entry = _pos.get("entry_price")
+            true_entry = float(_raw_entry or entry_price or 0)
             true_amount = float(sstate.get("entry_amount") or pos_value or 0)
             actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
             true_pnl_pct = ((actual_exit - true_entry) / true_entry) if true_entry > 0 else None
@@ -1369,7 +1409,12 @@ def run_live_cycle(
                 details=f"DYNAMIC_TP entry={true_entry or 0:.2f} exit={actual_exit:.2f} pnl={true_pnl_pct or 0:.2%} tp={fee_adjusted_tp:.2%} fill={sell_fill or 'N/A'}",
             )
             print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_TP pnl={true_pnl_pct or 0:.2%} fill={actual_exit:.2f}")
-            notify_sell(sym, actual_exit, true_pnl_pct, true_pnl_usd, true_amount, "dynamic_tp")
+            _disc_pnl_pct = true_pnl_pct
+            _disc_pnl_usd = true_pnl_usd
+            if _disc_pnl_pct is None and true_entry > 0:
+                _disc_pnl_pct = (actual_exit - true_entry) / true_entry
+                _disc_pnl_usd = _disc_pnl_pct * true_amount
+            notify_sell(sym, actual_exit, _disc_pnl_pct, _disc_pnl_usd, true_amount, "dynamic_tp")
             close_position(sym, actual_exit, true_pnl_pct, true_pnl_usd, "dynamic_tp")
             sstate["halt_until_day_key_et"] = dkey
 
@@ -1384,7 +1429,12 @@ def run_live_cycle(
             monitor.trade_count += 1
             # Fetch fill price FIRST, then compute PnL, then log — correct order
             sell_fill = client.get_fill_price(result["orderId"], log_file) if not client.dry_run else None
-            true_entry = float(sstate.get("entry_price") or entry_price or 0)
+            _raw_entry = sstate.get("entry_price")
+            if not _raw_entry or float(_raw_entry) <= 0:
+                _pos = get_open_position(sym)
+                if _pos:
+                    _raw_entry = _pos.get("entry_price")
+            true_entry = float(_raw_entry or entry_price or 0)
             true_amount = float(sstate.get("entry_amount") or pos_value or 0)
             actual_exit = sell_fill if sell_fill and sell_fill > 0 else float(current_price or 0)
             true_pnl_pct = ((actual_exit - true_entry) / true_entry) if true_entry > 0 else None
@@ -1409,7 +1459,12 @@ def run_live_cycle(
                 details=f"DYNAMIC_SL entry={true_entry or 0:.2f} exit={actual_exit:.2f} pnl={true_pnl_pct or 0:.2%} sl={dynamic_sl:.2%} fill={sell_fill or 'N/A'}",
             )
             print_status("SELL_SUBMITTED", f"{sym} DYNAMIC_SL pnl={true_pnl_pct or 0:.2%} fill={actual_exit:.2f}")
-            notify_sell(sym, actual_exit, true_pnl_pct, true_pnl_usd, true_amount, "dynamic_sl")
+            _disc_pnl_pct = true_pnl_pct
+            _disc_pnl_usd = true_pnl_usd
+            if _disc_pnl_pct is None and true_entry > 0:
+                _disc_pnl_pct = (actual_exit - true_entry) / true_entry
+                _disc_pnl_usd = _disc_pnl_pct * true_amount
+            notify_sell(sym, actual_exit, _disc_pnl_pct, _disc_pnl_usd, true_amount, "dynamic_sl")
             close_position(sym, actual_exit, true_pnl_pct, true_pnl_usd, "dynamic_sl")
             sstate["halt_until_day_key_et"] = dkey
             trigger_cooldown(sstate, loss_cooldown_days)
