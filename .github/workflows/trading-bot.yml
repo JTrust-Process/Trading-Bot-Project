@@ -3,7 +3,6 @@ name: public-trading-bot
 on:
   schedule:
     - cron: "17 13-21 * * 1-5"   # primary, mid-hour to avoid GHA peak load
-    - cron: "47 13-21 * * 1-5"   # redundant, 30 min later — catches missed runs
   workflow_dispatch: {}
 
 concurrency:

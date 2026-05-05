@@ -903,14 +903,31 @@ def get_unrealized_pnl_usd(pos: Dict[str, Any]) -> Optional[float]:
 
 
 def get_last_price(pos: Dict[str, Any]) -> Optional[float]:
+    # Try nested lastPrice.lastPrice first (Public portfolio format)
     lp: Dict[str, Any] = pos.get("lastPrice") or {}
     v: Optional[Any] = lp.get("lastPrice")
-    if v is None:
-        return None
+    if v is not None:
+        try:
+            return float(v)
+        except Exception:
+            pass
+    # Try top-level price fields
+    for key in ("lastPrice", "currentPrice", "price", "marketValue", "last", "mark"):
+        val = pos.get(key)
+        if val is not None and not isinstance(val, dict):
+            try:
+                return float(val)
+            except Exception:
+                pass
+    # Fallback: derive from position value / quantity
     try:
-        return float(v)
+        qty = get_position_qty(pos)
+        val_usd = get_position_value_usd(pos)
+        if qty and qty > 0 and val_usd and val_usd > 0:
+            return round(val_usd / qty, 4)
     except Exception:
-        return None
+        pass
+    return None
 
 
 def get_avg_cost(pos: Dict[str, Any]) -> Optional[float]:
@@ -1075,6 +1092,8 @@ def run_live_cycle(
         pnl_usd = get_unrealized_pnl_usd(pos)
         last_px = get_last_price(pos)
         avg_cost = get_avg_cost(pos)
+        if last_px is None:
+            print_status("PRICE_FALLBACK", f"{sym} last_px=None from portfolio — pos keys={list(pos.keys())[:8]}")
 
         snapshots.append({
             "symbol": sym,
