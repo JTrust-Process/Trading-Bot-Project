@@ -58,7 +58,7 @@ jobs:
           MAX_POSITION_SCALE: "2.0"
  
           # ── TP / SL ────────────────────────────────────────────────────────
-          TAKE_PROFIT_BASE: "0.05"
+          TAKE_PROFIT_BASE: "0.04"
           STOP_LOSS_BASE: "0.025"
           CONFIDENCE_MIN_THRESHOLD: "0.65"
           BREAKOUT_LOOKBACK: "25"
