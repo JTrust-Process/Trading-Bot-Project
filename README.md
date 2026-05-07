@@ -36,16 +36,117 @@ GitHub Actions (cron) → bot.py → Public.com API (orders)
 ├── strategy.py         # ATR and trend strength calculations
 ├── momentum.py         # Momentum scoring and ranking
 ├── breakout.py         # Volatility breakout signal engine
-├── market_data.py      # yfinance price data wrapper
+├── market_data.py      # Polygon price data wrapper (live bot path)
+├── public_bars.py      # NEW: Public.com historical bars data layer (additive)
+├── indicators.py       # NEW: pure-pandas SMA/EMA/ATR/momentum/breakout helpers
+├── backtest_public.py  # NEW: standalone backtest harness over Public bars
+├── analyze_backtests.py # NEW: multi-period symbol ranking + classification (advisory)
 ├── monitor.py          # Run lifecycle tracking (Supabase)
 ├── notify.py           # Discord webhook notifications
-├── backtest.py         # Backtesting engine (offline use)
+├── backtest.py         # Backtesting engine (offline use, yfinance based)
 ├── list_symbols.py     # Utility to list held positions
 ├── requirements.txt
 └── .github/
     └── workflows/
         └── trading-bot.yml
 ```
+
+---
+
+## Public.com historical bars (`public_bars.py`)
+
+We pull historical OHLCV directly from Public via:
+
+```
+GET https://api.public.com/userapigateway/marketdata/historicdata/{symbol}/{period}
+```
+
+Reference: <https://public.com/api/docs/resources/market-data/get-bars-v2>
+
+Supported periods: `DAY`, `WEEK`, `MONTH`, `QUARTER`, `HALF_YEAR`, `YEAR`,
+`FIVE_YEARS`, `YTD`, `SINCE_PURCHASE`. Default in our code is `YEAR`
+(~252 daily bars, enough for 200-day SMA / regime filters).
+
+The response is parsed defensively — Public returns numeric fields as strings,
+and we coerce them to floats. `regularMarket.bars` is read by default;
+`preMarket` and `afterMarket` can be opted into with flags.
+
+Quick check from your venv:
+
+```bash
+python public_bars.py SPY YEAR
+```
+
+This is **additive**. The live bot still uses `market_data.py` (Polygon) for
+its current price history. `public_bars.py` exists so we can backtest and
+A/B-compare a Public-bars-driven signal stack before migrating live trading.
+
+---
+
+## Backtest harness (`backtest_public.py`)
+
+Standalone offline script. Does **not** touch live order placement.
+
+```bash
+# Use Public.com bars (requires PUBLIC_SECRET):
+python backtest_public.py --source public --period YEAR
+
+# Or use yfinance for an offline baseline:
+python backtest_public.py --source yfinance --period YEAR
+```
+
+Default symbol universe: `SPY,QQQ,AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA`.
+Outputs `backtest_public_summary.csv` and `backtest_public_trades.csv`, plus
+a console table with: trades, win rate, avg win, avg loss, max drawdown,
+profit factor, total return.
+
+The harness runs both:
+
+1. **`old`** — replicates the live bot's SMA-cross + weighted momentum + recent-high breakout logic on the same bars.
+2. **`new`** — a more conservative bars-based variant: SPY-above-SMA(50) regime filter, ATR-based stop/take, minimum hold, cooldown after exit.
+
+Use this to compare signal quality before flipping any live trading code.
+
+---
+
+## Multi-period analyzer (`analyze_backtests.py`)
+
+Research / decision-support layer over `backtest_public.py`. Runs both
+strategies across `MONTH`, `QUARTER`, `HALF_YEAR`, and `YEAR` for every
+symbol, then aggregates with the median (robust to one bad period).
+
+```bash
+python analyze_backtests.py --source public
+python analyze_backtests.py --source yfinance
+python analyze_backtests.py --source public --periods QUARTER,HALF_YEAR,YEAR
+python analyze_backtests.py --source public --symbols SPY,QQQ,AAPL
+```
+
+Outputs:
+
+- `analyze_detail.csv` — every (symbol × period × strategy) row with
+  trades, win rate, avg win, avg loss, win/loss ratio, max drawdown, profit
+  factor, total return, bar count.
+- `analyze_ranking.csv` — one row per symbol with the OLD- and
+  NEW-strategy aggregated medians plus a classification.
+- A console table with the ranking sorted by classification.
+
+**Classification buckets** (from OLD-strategy aggregated metrics — the OLD
+strategy is what the live bot actually runs today):
+
+| classification    | label      | rough rule                                     |
+| ----------------- | ---------- | ---------------------------------------------- |
+| `keep_active`     | strong     | median ret >+5% & PF >=1.5 & >=50% positive periods & DD better than -20% |
+| `reduce_priority` | marginal   | median ret >0 & PF >=1.0 & >=50% positive periods                          |
+| `paper_only`      | unstable   | mixed signals across periods, didn't qualify above              |
+| `remove`          | weak       | median ret < -5% OR PF < 0.8 OR <25% positive periods           |
+
+The thresholds live as constants at the top of `analyze_backtests.py` —
+tune them freely; they're advisory.
+
+**This script is research-only.** It does not modify `bot.py`, order
+placement, risk settings, or `SCAN_SYMBOLS`. Use the output to inform a
+human decision about which symbols to keep, demote, paper-test, or drop.
 
 ---
 
