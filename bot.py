@@ -1521,28 +1521,50 @@ def run_live_cycle(
         # Fall back to Supabase positions table if not in local state (survives runner restarts)
         if pnl_pct is None:
             stored_entry = sstate.get("entry_price")
+            entry_source = "sstate"
             if not stored_entry:
                 pos_record = get_open_position(sym)
                 if pos_record:
                     stored_entry = pos_record.get("entry_price")
+                    entry_source = "supabase_positions"
                     if stored_entry:
                         sstate["entry_price"] = float(stored_entry)
                         sstate["entry_date"] = str(pos_record.get("entry_date") or "")
             if stored_entry and current_price and float(stored_entry) > 0:
                 pnl_pct = (float(current_price) - float(stored_entry)) / float(stored_entry)
                 append_log(log_file, "SYMBOL_STATE", symbol=sym,
-                    details=f"pnl_pct from entry_price: entry={float(stored_entry):.2f} last={current_price:.2f} pnl={pnl_pct:.2%}")
+                    details=f"pnl_pct from entry_price ({entry_source}): entry={float(stored_entry):.2f} last={current_price:.2f} pnl={pnl_pct:.2%}")
             else:
+                # Previously a silent `continue` — every TP/SL was skipped without
+                # explanation. Make this loud so we can see in the dashboard exactly
+                # which positions are missing entry data and why.
+                append_log(log_file, "SKIP", symbol=sym,
+                    details=(
+                        f"TP/SL skipped: pnl_pct unavailable "
+                        f"(api_gain_pct=None, sstate_entry={sstate.get('entry_price')}, "
+                        f"supabase_entry={stored_entry}, last_price={current_price})"
+                    ))
+                print_status("SKIP", f"{sym} TP/SL no pnl_pct, no entry_price found")
                 continue
 
         df = get_daily_bars(sym)
         if df is None or len(df) < trend_slow + 5:
+            append_log(log_file, "SKIP", symbol=sym,
+                details=f"TP/SL skipped: insufficient bars (got {len(df) if df is not None else 0}, need {trend_slow + 5})")
+            print_status("SKIP", f"{sym} TP/SL insufficient bars")
             continue
 
         atr = calculate_atr(df, atr_period)
         price = float(df["close"].iloc[-1])
 
         if not price or not atr or atr / price < atr_vol_threshold:
+            atr_pct = (atr / price) if (atr and price) else 0.0
+            append_log(log_file, "SKIP", symbol=sym,
+                details=(
+                    f"TP/SL skipped: ATR gate "
+                    f"(price={price}, atr={atr}, atr/price={atr_pct:.4%} < threshold={atr_vol_threshold:.2%})"
+                ))
+            print_status("SKIP", f"{sym} TP/SL ATR gate atr_pct={atr_pct:.4%} < {atr_vol_threshold:.2%}")
             continue
 
         strength = trend_strength(df, trend_fast, trend_slow)
@@ -1655,6 +1677,15 @@ def run_live_cycle(
             close_position(sym, actual_exit, true_pnl_pct, true_pnl_usd, "dynamic_sl")
             sstate["halt_until_day_key_et"] = dkey
             trigger_cooldown(sstate, loss_cooldown_days)
+
+        else:
+            # Position is held but neither TP nor SL triggered. Log the decision
+            # so the dashboard shows *why* we didn't sell (instead of just nothing).
+            append_log(log_file, "TP_SL_HOLD", symbol=sym,
+                details=(
+                    f"pnl={pnl_pct:.2%} between -sl={(-dynamic_sl):.2%} and tp={fee_adjusted_tp:.2%} "
+                    f"(strength={strength:.4f} scale={scale:.2f})"
+                ))
 
     # ----------------------------------------------------------
     # ENTRY LOGIC
