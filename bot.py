@@ -1363,15 +1363,63 @@ def run_live_cycle(
             print_status("SKIP", f"{sym} halted")
             continue
 
-        # Minimum hold period — prevents PDT violations (default 1 = no same-day sells)
-        # Pull entry_date from Supabase if not in local state (fresh GHA runner)
+        # ── Authoritative entry lookup ──────────────────────────────────
+        # Prefer the bot's own ledger (local sstate → Supabase positions row)
+        # over Public.com's instrumentGain.gainPercentage. The API value uses
+        # average cost basis across ALL lots — including any manual buys you
+        # placed in the Public app — so it can disagree significantly with
+        # what the bot actually paid. The bot only owns the orders it placed
+        # itself; using its captured fill price gives deterministic TP/SL.
+        bot_entry_price: Optional[float] = None
+        try:
+            _e = sstate.get("entry_price")
+            if _e is not None:
+                _ef = float(_e)
+                if _ef > 0:
+                    bot_entry_price = _ef
+        except Exception:
+            bot_entry_price = None
         entry_date_str = str(sstate.get("entry_date") or sstate.get("entry_day") or "")
-        if not entry_date_str:
+        if bot_entry_price is None or not entry_date_str:
             _pos = get_open_position(sym)
             if _pos:
-                entry_date_str = str(_pos.get("entry_date") or "")
-                if entry_date_str:
-                    sstate["entry_date"] = entry_date_str
+                if bot_entry_price is None:
+                    try:
+                        ep = _pos.get("entry_price")
+                        if ep is not None:
+                            epf = float(ep)
+                            if epf > 0:
+                                bot_entry_price = epf
+                                sstate["entry_price"] = epf
+                    except Exception:
+                        pass
+                if not entry_date_str:
+                    ed = str(_pos.get("entry_date") or "")
+                    if ed:
+                        entry_date_str = ed
+                        sstate["entry_date"] = ed
+
+        # Override pnl_pct with bot's own basis if we have a real entry price.
+        # API's avg-basis pnl is kept as `api_pnl_pct` for divergence logging.
+        api_pnl_pct = pnl_pct  # what Public's portfolio v2 reported
+        if bot_entry_price is not None and current_price is not None and float(current_price) > 0:
+            new_pnl_pct = (float(current_price) - bot_entry_price) / bot_entry_price
+            if api_pnl_pct is not None and abs(new_pnl_pct - api_pnl_pct) >= 0.005:
+                append_log(log_file, "PNL_BASIS_DIFF", symbol=sym,
+                    details=(
+                        f"bot_entry={bot_entry_price:.4f} bot_pnl={new_pnl_pct:.2%} | "
+                        f"api_avg_pnl={api_pnl_pct:.2%} | "
+                        f"diff={(new_pnl_pct - api_pnl_pct):.2%} "
+                        f"(bot uses bot_entry for TP/SL — api avg includes any manual lots)"
+                    ))
+            pnl_pct = new_pnl_pct
+            # entry_price below is used for log fields — keep it bot-basis too.
+            entry_price = bot_entry_price
+            # pnl_usd is best-effort: pnl_pct * pos_value approximates dollar PnL,
+            # accurate to the order of (1 + pnl_pct). Used for notifications only.
+            pnl_usd = pnl_pct * float(pos_value or 0)
+
+        # Minimum hold period — prevents PDT violations (default 1 = no same-day sells)
         if entry_date_str and min_hold_days > 0:
             try:
                 entry_dt = datetime.strptime(entry_date_str, "%Y-%m-%d").date()
