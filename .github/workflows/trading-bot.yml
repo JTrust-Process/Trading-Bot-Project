@@ -2,7 +2,9 @@ name: public-trading-bot
 
 on:
   schedule:
-    - cron: "17 13-21 * * 1-5"   # primary, mid-hour to avoid GHA peak load
+    # 14:17 - 20:17 UTC = 10:17 - 16:17 ET during EDT, 09:17 - 15:17 ET during EST.
+    # Tightened from "13-21" to skip pre-open / post-close cycles that just sleep & exit.
+    - cron: "17 14-20 * * 1-5"
   workflow_dispatch: {}
 
 concurrency:
@@ -29,6 +31,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run bot (one cycle)
+        id: bot
         env:
           MODE: "live"
           RUN_ONCE: "1"
@@ -42,11 +45,11 @@ jobs:
 
           # ── Symbols ────────────────────────────────────────────────────────
           SYMBOLS: "QQQ,SCHB,SCHD,SGOV,SPY,VTI"
-          SCAN_SYMBOLS: "AAPL,MSFT,NVDA,AMZN,GOOGL,TSLA"
+          SCAN_SYMBOLS: "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA"
           MANAGE_ALL_POSITIONS: "true"
 
           # ── Momentum-rotation ──────────────────────────────────────────────
-          MOMENTUM_SYMBOLS: "AAPL,MSFT,NVDA,AMZN,GOOGL,TSLA,QQQ,SPY"
+          MOMENTUM_SYMBOLS: "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,QQQ,SPY"
           MOMENTUM_TOP_N: "3"
           MOMENTUM_SELL_RANK: "5"
 
@@ -56,39 +59,52 @@ jobs:
           MAX_OPEN_POSITIONS: "8"
           BASE_POSITION_SIZE: "0.10"
           MAX_POSITION_SCALE: "2.0"
- 
+
           # ── TP / SL ────────────────────────────────────────────────────────
           TAKE_PROFIT_BASE: "0.04"
           STOP_LOSS_BASE: "0.025"
           CONFIDENCE_MIN_THRESHOLD: "0.65"
           BREAKOUT_LOOKBACK: "25"
           BREAKOUT_VOL_MULTIPLIER: "1.2"
- 
+
           # ── Risk / drawdown ────────────────────────────────────────────────
           MAX_DRAWDOWN: "0.08"
           DAILY_LOSS_LIMIT: "0.03"
           LOSS_COOLDOWN_DAYS: "3"
+          # Match documented PDT-prevention behavior in README.
           MIN_HOLD_DAYS: "2"
- 
+
           # ── Exposure cap ───────────────────────────────────────────────────
           MAX_EXPOSURE_EARLY: "0.90"
- 
+
           # ── Regime filter ──────────────────────────────────────────────────
           REGIME_SYMBOL: "SPY"
           REGIME_FAST: "20"
           REGIME_SLOW: "50"
- 
+
           # ── ATR / trend ────────────────────────────────────────────────────
           ATR_PERIOD: "14"
           ATR_VOL_THRESHOLD: "0.01"
           TREND_FAST: "5"
           TREND_SLOW: "20"
           TREND_STRONG_THRESHOLD: "0.5"
- 
+
           TZ: "America/New_York"
- 
+
         run: |
           python bot.py
+
+      - name: Finalize run row in Supabase
+        # Always run, even on timeout / failure. SIGKILL on the bot step does
+        # not run Python `finally`, so this script is what closes out bot_runs.
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          BOT_STATUS: ${{ steps.bot.outcome }}
+        run: |
+          python scripts/finalize_runs.py
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4

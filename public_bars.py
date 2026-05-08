@@ -67,6 +67,12 @@ _NUMERIC_KEYS = ("open", "high", "low", "close", "volume", "value")
 
 
 # -----------------------------
+# HTTP defaults
+# -----------------------------
+DEFAULT_TIMEOUT = 12.0  # seconds — short enough that a hung request gives up fast
+
+
+# -----------------------------
 # Token cache (process-local, never persisted)
 # -----------------------------
 _session = requests.Session()
@@ -219,7 +225,6 @@ def _bars_to_df(bars: List[Dict[str, Any]]) -> pd.DataFrame:
 # -----------------------------
 # Public API
 # -----------------------------
-DEFAULT_TIMEOUT = 12.0  # seconds — short enough that a hung request gives up fast
 
 
 def get_public_bars(

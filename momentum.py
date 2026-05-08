@@ -124,13 +124,22 @@ def should_sell_momentum(
     Returns True if a held symbol should be sold on momentum grounds:
       - Its score has gone negative, OR
       - Its rank has dropped below sell_rank_threshold
+
+    IMPORTANT: when the score is invalid (data fetch failed for this cycle),
+    return False — i.e. take no action. A transient Polygon outage should
+    NOT trigger a fire-sale of the entire momentum book.
     """
     for ms in all_scores:
         if ms.symbol == symbol:
+            # Don't act on bad data. Caller's other exit paths (TP/SL/drawdown)
+            # remain in effect via the live portfolio gainPercentage value.
+            if not ms.valid:
+                return False
             if ms.score <= 0:
                 return True
             if ms.rank > sell_rank_threshold:
                 return True
             return False
-    # Symbol not found in scores (no data) → sell to be safe
-    return True
+    # Symbol not in the scored universe (e.g. removed from MOMENTUM_SYMBOLS) —
+    # don't initiate a sell here; let TP/SL/drawdown decide.
+    return False

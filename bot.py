@@ -237,6 +237,42 @@ def print_status(event: str, details: str = "") -> None:
 
 
 def count_trades_today(log_file: str) -> int:
+    """
+    Count LIVE_BUY_SUBMITTED + LIVE_SELL_SUBMITTED events for today (ET).
+
+    Prefers Supabase (the only source that persists across ephemeral GHA runs).
+    Falls back to the local CSV if Supabase isn't configured — useful for local dev.
+    """
+    global supabase
+
+    # Prefer Supabase: persists across GHA runs, which the local CSV does not.
+    if supabase is not None:
+        try:
+            now_et = datetime.now(NY_TZ)
+            day_start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_start_utc_iso = day_start_et.astimezone(timezone.utc).isoformat()
+            # NOTE: supabase-py expects a `CountMethod` enum for `count`; "exact"
+            # is the runtime-accepted string. Suppressing the type warning here
+            # is safer than importing from a private postgrest path that varies
+            # by client version.
+            res = (
+                supabase.table("bot_logs")
+                .select("event", count="exact")  # type: ignore[arg-type]
+                .in_("event", ["LIVE_BUY_SUBMITTED", "LIVE_SELL_SUBMITTED"])
+                .gte("timestamp_utc", day_start_utc_iso)
+                .execute()
+            )
+            # supabase-py returns the row count in res.count when count="exact"
+            res_count = getattr(res, "count", None)
+            if res_count is not None:
+                return int(res_count or 0)
+            # Fallback: len(data) (capped by default page size, but accurate for low-volume)
+            return len(res.data or [])
+        except Exception as e:
+            print_status("TRADES_COUNT_SUPABASE_ERROR", str(e))
+            # Fall through to CSV fallback so the bot still has *some* signal
+
+    # Local CSV fallback (development / Supabase outage)
     if not os.path.exists(log_file):
         return 0
     tkey_et = today_key_et()
@@ -470,6 +506,36 @@ def maybe_send_daily_summary(
 # State (per-symbol) — consolidated from risk.py
 # -----------------------------
 def load_state() -> Dict[str, Any]:
+    """
+    Load per-symbol state. Order of preference:
+      1. Supabase `bot_state` table  (persists across GHA runs — authoritative)
+      2. Local STATE_FILE             (local dev, or Supabase outage)
+      3. Empty                        (first run)
+
+    Cooldowns, drawdown peaks, and day-start values must persist across
+    runs or the risk controls are no-ops on ephemeral GHA runners.
+    """
+    global supabase
+
+    # 1. Supabase
+    if supabase is not None:
+        try:
+            res = supabase.table("bot_state").select("symbol,state").execute()
+            if res.data:
+                symbols_state: Dict[str, Any] = {}
+                for row in res.data:
+                    row_d: Dict[str, Any] = cast(Dict[str, Any], row)
+                    sym = str(row_d.get("symbol") or "").upper().strip()
+                    raw_state = row_d.get("state") or {}
+                    if sym and isinstance(raw_state, dict):
+                        symbols_state[sym] = raw_state
+                if symbols_state:
+                    return {"symbols": symbols_state}
+        except Exception as e:
+            print_status("STATE_LOAD_SUPABASE_ERROR", str(e))
+            # fall through
+
+    # 2. Local file fallback
     if not os.path.exists(STATE_FILE):
         return {"symbols": {}}
     try:
@@ -483,10 +549,40 @@ def load_state() -> Dict[str, Any]:
 
 
 def save_state(state: Dict[str, Any]) -> None:
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
-    os.replace(tmp, STATE_FILE)
+    """
+    Persist state to BOTH the local file (handy for local dev) AND Supabase
+    (the only source that survives a fresh GHA runner). Failures on either
+    side are logged but never crash the bot.
+    """
+    global supabase
+
+    # Local file (best-effort — directory may be read-only in some envs)
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        print_status("STATE_SAVE_FILE_ERROR", str(e))
+
+    # Supabase mirror
+    if supabase is None:
+        return
+    try:
+        symbols_state: Dict[str, Any] = state.get("symbols", {}) or {}
+        rows = [
+            {
+                "symbol": str(sym).upper(),
+                "state": sstate or {},
+                "updated_at": utcnow().isoformat(),
+            }
+            for sym, sstate in symbols_state.items()
+            if sym
+        ]
+        if rows:
+            supabase.table("bot_state").upsert(rows, on_conflict="symbol").execute()
+    except Exception as e:
+        print_status("STATE_SAVE_SUPABASE_ERROR", str(e))
 
 
 def sym_state(state: Dict[str, Any], symbol: str) -> Dict[str, Any]:
@@ -558,6 +654,58 @@ def compute_max_exposure(
 
 
 # -----------------------------
+# HTTP retry helper (for read-only API calls — NEVER used for order POSTs)
+# -----------------------------
+def _http_with_retry(
+    method: str,
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    timeout: int = 30,
+    max_attempts: int = 3,
+    label: str = "",
+) -> requests.Response:
+    """
+    Retry transient network errors and 5xx responses with exponential backoff.
+    Never retries 4xx (those are deterministic — auth, validation, idempotency).
+    NEVER call this for order placement; idempotency on Public is per-orderId
+    not per-attempt, and a duplicate would mean a duplicate fill.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            resp = requests.request(
+                method.upper(),
+                url,
+                headers=headers,
+                json=json_body,
+                timeout=timeout,
+            )
+            # Retry only on 5xx
+            if 500 <= resp.status_code < 600 and attempt < max_attempts - 1:
+                wait = 2 ** attempt
+                print_status("HTTP_RETRY",
+                    f"{label} {method} {resp.status_code} attempt={attempt + 1}/{max_attempts} backoff={wait}s body={resp.text[:200]}")
+                time.sleep(wait)
+                continue
+            return resp
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_exc = e
+            if attempt < max_attempts - 1:
+                wait = 2 ** attempt
+                print_status("HTTP_RETRY",
+                    f"{label} {method} network_error={type(e).__name__} attempt={attempt + 1}/{max_attempts} backoff={wait}s")
+                time.sleep(wait)
+                continue
+            raise
+    # Exhausted without returning a response (only via continue path on 5xx)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{label} {method} {url}: retry loop exited without response")
+
+
+# -----------------------------
 # Token Manager
 # -----------------------------
 @dataclass
@@ -574,12 +722,17 @@ class PublicAuth:
         self._access: Optional[AccessToken] = None
 
     def _fetch_token(self) -> AccessToken:
-        resp = requests.post(
+        resp = _http_with_retry(
+            "POST",
             AUTH_URL,
             headers={"Content-Type": "application/json"},
-            json={"secret": self.secret, "validityInMinutes": self.validity_minutes},
+            json_body={"secret": self.secret, "validityInMinutes": self.validity_minutes},
             timeout=30,
+            label="auth",
         )
+        if not resp.ok:
+            # Log status + body so misconfig (bad secret, IP block, etc.) is visible
+            print_status("AUTH_ERROR", f"status={resp.status_code} body={resp.text[:500]}")
         resp.raise_for_status()
         token = resp.json()["accessToken"]
         expires_at = utcnow() + timedelta(minutes=max(1, self.validity_minutes - 2))
@@ -609,7 +762,13 @@ class PublicClient:
     def get_account_id(self) -> str:
         if self._account_id:
             return self._account_id
-        resp = requests.get(ACCOUNT_URL, headers=self.auth.auth_headers(), timeout=30)
+        resp = _http_with_retry(
+            "GET", ACCOUNT_URL,
+            headers=self.auth.auth_headers(),
+            timeout=30, label="account",
+        )
+        if not resp.ok:
+            print_status("ACCOUNT_ERROR", f"status={resp.status_code} body={resp.text[:500]}")
         resp.raise_for_status()
         accounts: list[dict[str, Any]] = resp.json().get("accounts") or []
         if not accounts:
@@ -621,22 +780,28 @@ class PublicClient:
 
     def get_portfolio_v2(self) -> Dict[str, Any]:
         account_id = self.get_account_id()
-        resp = requests.get(
+        resp = _http_with_retry(
+            "GET",
             PORTFOLIO_V2_URL_TMPL.format(accountId=account_id),
             headers=self.auth.auth_headers(),
-            timeout=30,
+            timeout=30, label="portfolio",
         )
+        if not resp.ok:
+            print_status("PORTFOLIO_ERROR", f"status={resp.status_code} body={resp.text[:500]}")
         resp.raise_for_status()
         return resp.json()
 
     def get_quotes(self, instruments: List[Dict[str, str]]) -> Dict[str, Any]:
         account_id = self.get_account_id()
-        resp = requests.post(
+        resp = _http_with_retry(
+            "POST",
             QUOTES_URL_TMPL.format(accountId=account_id),
             headers={**self.auth.auth_headers(), "Content-Type": "application/json"},
-            json={"instruments": instruments},
-            timeout=30,
+            json_body={"instruments": instruments},
+            timeout=30, label="quotes",
         )
+        if not resp.ok:
+            print_status("QUOTES_ERROR", f"status={resp.status_code} body={resp.text[:500]}")
         resp.raise_for_status()
         return resp.json()
 
@@ -685,7 +850,10 @@ class PublicClient:
 
         for attempt in range(4):
             try:
-                time.sleep(2)
+                # First attempt: try immediately. Subsequent attempts: 2s backoff so
+                # an instantly-filled order doesn't pay a 2s latency tax.
+                if attempt > 0:
+                    time.sleep(2)
                 resp = requests.get(url, headers=self.auth.auth_headers(), timeout=15)
 
                 if resp.status_code != 200:
@@ -775,7 +943,7 @@ class PublicClient:
             timeout=30,
         )
         if not resp.ok:
-            print_status("ORDER_RESPONSE_ERROR", f"BUY {symbol} status={resp.status_code} body={resp.text[:500]}")
+            print_status("ORDER_RESPONSE_ERROR", f"SELL {symbol} status={resp.status_code} body={resp.text[:500]}")
         resp.raise_for_status()
         return {"orderId": order_id, "response": resp.json()}
 
@@ -1515,8 +1683,17 @@ def run_live_cycle(
             if open_positions >= max_open_positions:
                 break
 
-            # Skip if already holding
+            # Skip if already holding (live portfolio is the source of truth)
             if find_equity_position(portfolio, sym):
+                continue
+
+            # Belt-and-suspenders: also check Supabase. If a recent buy hasn't
+            # surfaced in the portfolio mirror yet (very rare for market orders
+            # but possible across short cron cadences), this prevents a duplicate.
+            existing_open = get_open_position(sym)
+            if existing_open:
+                append_log(log_file, "SKIP", symbol=sym,
+                    details=f"Open Supabase position exists (entry={existing_open.get('entry_date')}); skipping buy")
                 continue
 
             # Skip if in cooldown
@@ -1841,13 +2018,18 @@ if __name__ == "__main__":
         raise
     finally:
         # Always mark the run as complete, even if killed or crashed
+        final_status = (
+            "failed" if monitor.critical_error
+            else "warning" if monitor.error_count > 0
+            else "success"
+        )
         try:
-            monitor.end_run()
+            monitor.end_run(final_status)
         except Exception:
             pass
         try:
             notify_run_end(
-                status="failed" if monitor.critical_error else "warning" if monitor.error_count > 0 else "success",
+                status=final_status,
                 trades=monitor.trade_count,
                 errors=monitor.error_count,
                 duration_ms=int((datetime.now(timezone.utc) - monitor.start_time).total_seconds() * 1000) if monitor.start_time else 0,

@@ -227,6 +227,11 @@ create policy "Allow public read" on trades for select using (true);
 -- repeat for bot_runs, bot_events, bot_errors, bot_logs
 ```
 
+For audit fixes (per-symbol state mirror, ID defaults, positions unique
+constraint), run the migration in `supabase_migrations/2026_05_08_audit_fixes.sql`
+in the Supabase SQL editor. This is required for cooldowns, drawdown peaks,
+and the daily-loss kill switch to actually persist across GitHub Actions runs.
+
 Also create the positions table for open/closed position tracking:
 
 ```sql
@@ -294,7 +299,7 @@ All config is set via environment variables. Key parameters:
 | `REGIME_SYMBOL` | `SPY` | Symbol used for regime detection |
 | `REGIME_FAST` | `20` | Fast SMA for regime (20-day) — price must be above this |
 | `REGIME_SLOW` | `50` | Slow SMA for regime (50-day) — price must be above this |
-| `MIN_HOLD_DAYS` | `2` | Minimum days to hold before selling (prevents PDT) |
+| `MIN_HOLD_DAYS` | `1` (code) / `2` (workflow) | Minimum days to hold before selling (prevents PDT). Workflow sets `2`. |
 | `CONFIDENCE_MIN_THRESHOLD` | `0.3` | Minimum confidence score to buy |
 | `BREAKOUT_LOOKBACK` | `20` | Bars to define consolidation range |
 | `BREAKOUT_THRESHOLD_BULL` | `0.1` | Bull breakout threshold (10% of range) |
