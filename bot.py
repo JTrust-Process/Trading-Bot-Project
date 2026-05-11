@@ -16,6 +16,7 @@ from momentum import rank_symbols, should_sell_momentum
 from breakout import check_breakout
 from supabase import create_client
 from monitor import monitor
+import league_status  # ADDITIVE — fail-silent League heartbeat. Touches NO trading logic.
 from notify import (
     notify_buy, notify_sell, notify_run_start,
     notify_run_end, notify_error, notify_regime_change,
@@ -1945,6 +1946,13 @@ def main() -> None:
 
     monitor.start_run()
 
+    # League heartbeat — additive, fail-silent. Does NOT affect monitor.start_run()
+    # or any trading logic. If the League project is unreachable, this no-ops.
+    try:
+        league_status.start_run("cron")
+    except Exception:
+        pass
+
     mode = get_env_str("MODE", "live").lower()
     if mode != "live":
         raise RuntimeError("This file is LIVE-only. Set MODE=live")
@@ -2104,6 +2112,16 @@ if __name__ == "__main__":
         )
         try:
             monitor.end_run(final_status)
+        except Exception:
+            pass
+        # League end_run — additive, fail-silent. Closes the bot_runs row in the
+        # League project and pushes a final heartbeat with the run outcome.
+        try:
+            league_status.end_run(
+                status=final_status,
+                trade_count=monitor.trade_count,
+                error_count=monitor.error_count,
+            )
         except Exception:
             pass
         try:

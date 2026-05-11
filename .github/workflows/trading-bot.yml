@@ -43,6 +43,11 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
 
+          # ── Trading Bot League (additive — fail-silent if unreachable) ────
+          LEAGUE_SUPABASE_URL: ${{ secrets.LEAGUE_SUPABASE_URL }}
+          LEAGUE_SUPABASE_KEY: ${{ secrets.LEAGUE_SUPABASE_KEY }}
+          LEAGUE_BOT_ID: "stock_momentum_v1"
+
           # ── Symbols ────────────────────────────────────────────────────────
           SYMBOLS: "QQQ,SCHB,SCHD,SGOV,SPY,VTI"
           SCAN_SYMBOLS: "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA"
