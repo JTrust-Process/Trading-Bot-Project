@@ -206,4 +206,75 @@ def end_run(
     _current_run_id = None  # consumed
 
 
-__all__ = ["heartbeat", "start_run", "end_run"]
+# ── Trade mirror ────────────────────────────────────────────────────────────
+# A small allow-list of ETF tickers used by this bot. Anything not in this
+# set defaults to asset_class='equity'. Hand-edit if you add new ETFs to
+# the bot's SYMBOLS / SCAN_SYMBOLS / MOMENTUM_SYMBOLS.
+_ETF_SYMBOLS = frozenset({
+    "QQQ", "SPY", "VTI", "SCHB", "SCHD", "SGOV",
+    "IWM", "DIA", "VOO", "VEA", "VWO",
+    "XLK", "XLF", "XLE", "XLY", "XLV", "XLI", "XLP", "XLU", "XLB", "XLRE", "XLC",
+    "BND", "TLT", "HYG", "LQD", "GLD", "SLV", "UUP",
+})
+
+
+def _classify(symbol: str) -> str:
+    return "etf" if (symbol or "").upper() in _ETF_SYMBOLS else "equity"
+
+
+def log_trade(
+    symbol: str,
+    side: str,
+    *,
+    quantity: Optional[float] = None,
+    price: Optional[float] = None,
+    amount_usd: Optional[float] = None,
+    fees_usd: float = 0.0,
+    pnl_usd: Optional[float] = None,
+    pnl_pct: Optional[float] = None,
+    reason: Optional[str] = None,
+    strategy: Optional[str] = None,
+    is_paper: bool = False,
+    order_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> None:
+    """Mirror a trade into the League's bot_trades table. Fail-silent.
+
+    Side is uppercased and validated against the table's CHECK constraint.
+    Asset class is auto-derived from a small ETF allow-list; anything else
+    is recorded as 'equity'. The unique partial index on (bot_id, order_id)
+    in the table makes repeat inserts of the same Public order_id idempotent
+    at the DB level — but we do NOT retry here; one shot per call.
+    """
+    cfg = _config()
+    if cfg is None:
+        return
+    side_u = (side or "").upper()
+    if side_u not in ("BUY", "SELL", "SHORT", "COVER"):
+        _print(f"log_trade: invalid side={side!r}; skipping")
+        return
+    rid = run_id if run_id is not None else _current_run_id
+    row: dict[str, Any] = {
+        "bot_id":      cfg["bot_id"],
+        "run_id":      rid,
+        "occurred_at": _now_iso(),
+        "symbol":      symbol,
+        "asset_class": _classify(symbol),
+        "side":        side_u,
+        "quantity":    quantity,
+        "price":       price,
+        "amount_usd":  amount_usd,
+        "fees_usd":    fees_usd or 0,
+        "pnl_usd":     pnl_usd,
+        "pnl_pct":     pnl_pct,
+        "reason":      reason,
+        "strategy":    strategy,
+        "is_paper":    bool(is_paper),
+        "order_id":    order_id,
+        "metadata":    metadata or {},
+    }
+    _post(cfg, "bot_trades", [row], upsert=False)
+
+
+__all__ = ["heartbeat", "start_run", "end_run", "log_trade"]

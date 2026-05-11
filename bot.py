@@ -335,6 +335,25 @@ def log_trade(
     except Exception as e:
         print_status("SUPABASE_ERROR", str(e))
 
+    # League mirror — additive, fail-silent. Stock bot trades use a single
+    # log_trade() callsite for both BUY (entry_price set, exit_price/PnL None)
+    # and SELL (exit_price + PnL set). We pick the realized price accordingly
+    # so bot_trades.price always reflects the side's fill price.
+    try:
+        is_buy = (side or "").upper() == "BUY"
+        league_status.log_trade(
+            symbol=symbol,
+            side=side,
+            price=(entry_price if is_buy else exit_price),
+            amount_usd=amount_usd,
+            pnl_usd=(None if is_buy else pnl_usd),
+            pnl_pct=(None if is_buy else pnl_pct),
+            strategy=strategy,
+            is_paper=False,  # this code path only runs in live mode (asserted in main())
+        )
+    except Exception:
+        pass
+
 
 
 # -----------------------------
