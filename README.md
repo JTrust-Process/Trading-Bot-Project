@@ -166,6 +166,11 @@ pip install -r requirements.txt
 
 ```dotenv
 PUBLIC_SECRET=your_public_api_secret
+# Optional, but REQUIRED if your Public personal access token can see more
+# than one brokerage account. Otherwise the bot defaults to accounts[0] and
+# can silently lock onto the wrong/empty account, missing every TP/SL.
+# Run `python scripts/list_public_accounts.py` to see the available IDs.
+# PUBLIC_ACCOUNT_ID=your_brokerage_account_id
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_KEY=your_service_role_key
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
@@ -266,6 +271,7 @@ Go to **Settings → Secrets → Actions** and add:
 | Secret | Description |
 |--------|-------------|
 | `PUBLIC_SECRET` | Public.com API secret |
+| `PUBLIC_ACCOUNT_ID` | (Optional) Pins which brokerage account to trade against. **Required if you have more than one Public brokerage account under the same login** — otherwise the bot defaults to `accounts[0]` and can lock onto the wrong/empty account, silently skipping every TP/SL. Run `python scripts/list_public_accounts.py` locally to get the IDs. |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_SERVICE_KEY` | Supabase service role key |
 | `DISCORD_WEBHOOK_URL` | Discord webhook URL |

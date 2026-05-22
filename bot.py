@@ -780,6 +780,22 @@ class PublicClient:
         self._account_id: Optional[str] = None
 
     def get_account_id(self) -> str:
+        """
+        Resolve the Public brokerage accountId to use for every trading call.
+
+        A single Public personal access token can authenticate against MULTIPLE
+        brokerage accounts (e.g. if the user has opened a second brokerage
+        account under the same login). The /account endpoint then returns an
+        array, and picking accounts[0] is fragile — order is not guaranteed
+        and a newly-opened empty account can shadow the real one, causing the
+        bot to read equity=0 / positions=[] and silently skip every TP/SL.
+
+        Resolution order:
+          1. PUBLIC_ACCOUNT_ID env var (preferred — explicit pin).
+          2. The only BROKERAGE account, if exactly one exists.
+          3. accounts[0] as a last-resort fallback (with a loud warning if
+             more than one account was returned).
+        """
         if self._account_id:
             return self._account_id
         resp = _http_with_retry(
@@ -793,9 +809,82 @@ class PublicClient:
         accounts: list[dict[str, Any]] = resp.json().get("accounts") or []
         if not accounts:
             raise RuntimeError("No accounts returned from Public.")
-        self._account_id = str(accounts[0]["accountId"])
-        append_log(self.log_file, "ACCOUNT_LOADED", details="accountId loaded.")
-        print_status("ACCOUNT_LOADED")
+
+        # Compact diagnostic summary of every account the token can see.
+        # Helps the user pick the right PUBLIC_ACCOUNT_ID without leaking
+        # full IDs (mask all but last 4 chars).
+        def _mask(aid: str) -> str:
+            s = str(aid)
+            return s if len(s) <= 4 else f"...{s[-4:]}"
+        summary = ", ".join(
+            f"{_mask(a.get('accountId', ''))}({a.get('accountType', '?')}/"
+            f"{a.get('brokerageAccountType', '?')})"
+            for a in accounts
+        )
+
+        pinned = (os.environ.get("PUBLIC_ACCOUNT_ID") or "").strip()
+        chosen: Optional[dict[str, Any]] = None
+        selection_reason = ""
+
+        if pinned:
+            for a in accounts:
+                if str(a.get("accountId") or "") == pinned:
+                    chosen = a
+                    selection_reason = "env:PUBLIC_ACCOUNT_ID"
+                    break
+            if chosen is None:
+                # Pin set but not found — refuse to fall back silently. A bad
+                # pin would otherwise put us back into the original failure
+                # mode (wrong account, empty portfolio, no exits firing).
+                append_log(
+                    self.log_file, "ACCOUNT_PIN_NOT_FOUND",
+                    details=f"PUBLIC_ACCOUNT_ID={_mask(pinned)} not in accounts=[{summary}]",
+                )
+                raise RuntimeError(
+                    f"PUBLIC_ACCOUNT_ID={_mask(pinned)} did not match any "
+                    f"account returned by Public. Available: [{summary}]"
+                )
+
+        if chosen is None:
+            brokerage = [a for a in accounts if str(a.get("accountType") or "").upper() == "BROKERAGE"]
+            if len(brokerage) == 1:
+                chosen = brokerage[0]
+                selection_reason = "sole-brokerage"
+            elif len(accounts) == 1:
+                chosen = accounts[0]
+                selection_reason = "sole-account"
+
+        if chosen is None:
+            # Multiple accounts and no pin — fall back to [0] but make the
+            # ambiguity extremely visible so the user knows to set the env var.
+            chosen = accounts[0]
+            selection_reason = "fallback-index-0-AMBIGUOUS"
+            append_log(
+                self.log_file, "ACCOUNT_AMBIGUOUS",
+                details=(
+                    f"{len(accounts)} accounts returned and PUBLIC_ACCOUNT_ID "
+                    f"not set; defaulting to [0]. Set PUBLIC_ACCOUNT_ID to one of: "
+                    f"[{summary}]"
+                ),
+            )
+            print_status(
+                "ACCOUNT_AMBIGUOUS",
+                f"{len(accounts)} accounts; defaulting to [0]. "
+                f"Set PUBLIC_ACCOUNT_ID. Available: [{summary}]",
+            )
+
+        self._account_id = str(chosen["accountId"])
+        append_log(
+            self.log_file, "ACCOUNT_LOADED",
+            details=(
+                f"selected={_mask(self._account_id)} "
+                f"type={chosen.get('accountType', '?')}/"
+                f"{chosen.get('brokerageAccountType', '?')} "
+                f"reason={selection_reason} available=[{summary}]"
+            ),
+        )
+        print_status("ACCOUNT_LOADED",
+            f"selected={_mask(self._account_id)} reason={selection_reason}")
         return self._account_id
 
     def get_portfolio_v2(self) -> Dict[str, Any]:
@@ -1318,6 +1407,47 @@ def run_live_cycle(
         f"equity={total_equity:.2f} exposure={total_exposure:.2%} "
         f"cap={cap_total:.2%} positions={len(snapshots)}",
     )
+
+    # ----------------------------------------------------------
+    # Safety guard: empty portfolio while Supabase has open positions
+    # ----------------------------------------------------------
+    # If Public returned equity=0 / bp=0 / no snapshots but we have open
+    # positions recorded in Supabase, the API is almost certainly pointed at
+    # the wrong account (e.g. PUBLIC_ACCOUNT_ID missing when the token can
+    # see multiple accounts). Without this guard the exit loop iterates an
+    # empty list and silently skips TP/SL for every real holding.
+    if total_equity == 0 and buying_power == 0 and not snapshots:
+        ghost_opens: list[str] = []
+        if supabase is not None:
+            try:
+                ghost_res = (
+                    supabase.table("positions")
+                    .select("symbol")
+                    .eq("status", "open")
+                    .execute()
+                )
+                ghost_opens = [
+                    str(r.get("symbol") or "")
+                    for r in (ghost_res.data or [])
+                    if r.get("symbol")
+                ]
+            except Exception as _e:
+                print_status("GHOST_CHECK_ERROR", str(_e))
+        if ghost_opens:
+            msg = (
+                f"Public portfolio is empty (equity=0, bp=0, positions=0) "
+                f"but Supabase has {len(ghost_opens)} open positions: "
+                f"{','.join(sorted(set(ghost_opens))[:10])}. "
+                f"Likely wrong account selected — set PUBLIC_ACCOUNT_ID. "
+                f"Skipping cycle to avoid silently missing TP/SL."
+            )
+            append_log(log_file, "PORTFOLIO_EMPTY_ABORT", details=msg)
+            print_status("PORTFOLIO_EMPTY_ABORT", msg)
+            try:
+                notify_error("run_live_cycle", msg, severity="critical")
+            except Exception:
+                pass
+            return
 
     # ----------------------------------------------------------
     # Hard lockdown: sell everything we manage

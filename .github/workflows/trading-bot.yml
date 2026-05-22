@@ -38,6 +38,13 @@ jobs:
 
           # ── Secrets ────────────────────────────────────────────────────────
           PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
+          # Pin which brokerage account this bot trades against. REQUIRED if
+          # the Public personal access token can see more than one brokerage
+          # account (e.g. you opened a second account for another bot under
+          # the same login). Without it, the bot defaults to accounts[0],
+          # which can silently lock onto the wrong/empty account and miss
+          # every TP/SL. Store the full accountId in this GH secret.
+          PUBLIC_ACCOUNT_ID: ${{ secrets.PUBLIC_ACCOUNT_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
