@@ -1,10 +1,16 @@
 name: public-trading-bot
 
 on:
-  schedule:
-    # 14:17 - 20:17 UTC = 10:17 - 16:17 ET during EDT, 09:17 - 15:17 ET during EST.
-    # Tightened from "13-21" to skip pre-open / post-close cycles that just sleep & exit.
-    - cron: "17 14-20 * * 1-5"
+  # DISABLED 2026-07-05 — migrated to Fly (agent_runner). Rollback path:
+  # uncomment the schedule below AND unset LIVE_BOTS_ENABLED on the Fly
+  # app `trading-bot-league-agent-runner`. workflow_dispatch stays for
+  # emergency manual runs; the actual bot code (bot.py etc.) is
+  # unchanged.
+  #
+  # schedule:
+  #   # 14:17 - 20:17 UTC = 10:17 - 16:17 ET during EDT, 09:17 - 15:17 ET during EST.
+  #   # Tightened from "13-21" to skip pre-open / post-close cycles that just sleep & exit.
+  #   - cron: "17 14-20 * * 1-5"
   workflow_dispatch: {}
 
 concurrency:
